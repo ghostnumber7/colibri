@@ -6326,6 +6326,8 @@ int main(int argc, char **argv){
     }
 #ifdef _WIN32
     _setmode(fileno(stdout), O_BINARY);
+    _setmaxstdio(2048);   /* CRT fd table defaults to 512; the mirror opens up to 4 handles
+                           * per shard (buffered + O_DIRECT, on both drives) */
 #endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     if(getenv("I4_ACC512")) g_i4_acc512=atoi(getenv("I4_ACC512"))!=0;

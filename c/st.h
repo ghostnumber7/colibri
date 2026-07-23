@@ -169,7 +169,7 @@ static int st_mirror_init(shards *S, const char *dir) {
         S->mfds[i] = mfd;
 #ifdef O_DIRECT
         S->mdfds[i] = open(mp, COMPAT_O_RDONLY | O_DIRECT);
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(_WIN32)
         S->mdfds[i] = compat_open_direct(mp);
 #endif
         S->nmirror++;
