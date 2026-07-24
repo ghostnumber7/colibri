@@ -155,6 +155,9 @@ typedef struct {
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used;
+                 int slab_reg; /* stream tier page-pinning: 0 unregistered, 1 registered, 2 refused.
+                                * Written only single-threaded (eager pin registration at startup,
+                                * teardown after the worker is joined) — read-only during decode. */
                  /* pin-arena backing (#419): when set, slab/fslab are interior
                   * slices of a per-layer arena and must never be free()d —
                   * expert_host_release detaches them, expert_host_ensure
@@ -307,6 +310,46 @@ static int qt_cuda_update(QT *t){
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
 static double g_ovl_issue,g_ovl_cpu,g_ovl_take,g_ovl_mark; /* Inc.4 overlap-window split (OVL report) */
+/* ---- streamed warm experts: page-pinning of the resident PIN set for async DMA.
+ * cudaHostRegister makes a slab DMA-able so coli_cuda_expert_stream's uploads run as
+ * true async PCIe transfers next to the CPU expert path. Only the STABLE pin set is
+ * registered, EAGERLY at pin_load (single-threaded — see stream_register_pins), so
+ * slab_reg is read-only during decode and needs no locking, and the ONLY place a
+ * registered slab is freed is teardown or a REPIN promotion (expert_host_release).
+ * STREAM_GB caps total pinned bytes; slab_reg==2 is a sticky refusal (over budget). */
+static int g_stream_on=0;
+/* Default OFF: registering host slabs for DMA page-locks them, so STREAM_GB GB of
+ * RAM leave the page cache while pinned. Opt-in: STREAM_GB=<gb>. */
+static double g_stream_budget_gb=0.0;
+/* STREAM_PIN=1 (default): only pin-tier slabs are stream-eligible — already
+ * mlock-wired and page-locked for DMA. STREAM_PIN=0 also streams the LRU slabs, but
+ * UNREGISTERED (they churn, so we never page-lock them): correct, just not pipelined
+ * — and no eviction path ever has to release page-locked memory. */
+static int g_stream_pin=1;
+static _Atomic int64_t g_stream_reg_bytes=0;
+static int stream_try_register(ESlot *e){
+    if(e->slab_reg==1) return 1;
+    if(e->slab_reg==2 || !e->slab || !e->fslab) return 0;
+    int64_t need=e->slab_cap + e->fslab_cap*(int64_t)sizeof(float);
+    if(atomic_load_explicit(&g_stream_reg_bytes,memory_order_relaxed)+need >
+       (int64_t)(g_stream_budget_gb*1e9)){ e->slab_reg=2; return 0; }
+    if(!coli_cuda_host_register(e->slab,(size_t)e->slab_cap)){ e->slab_reg=2; return 0; }
+    if(!coli_cuda_host_register(e->fslab,(size_t)e->fslab_cap*sizeof(float))){
+        coli_cuda_host_unregister(e->slab); e->slab_reg=2; return 0; }
+    atomic_fetch_add_explicit(&g_stream_reg_bytes,need,memory_order_relaxed);
+    e->slab_reg=1; return 1;
+}
+/* must run before a registered slab/fslab is freed or realloc'd: freeing
+ * page-locked-registered memory corrupts the driver's pinned tracking
+ * (measured as a cascade of "invalid argument" on every later CUDA call). */
+static void stream_unregister(ESlot *e){
+    if(e->slab_reg!=1) return;
+    if(e->slab) coli_cuda_host_unregister(e->slab);
+    if(e->fslab) coli_cuda_host_unregister(e->fslab);
+    atomic_fetch_sub_explicit(&g_stream_reg_bytes,
+        e->slab_cap + e->fslab_cap*(int64_t)sizeof(float),memory_order_relaxed);
+    e->slab_reg=0;
+}
 static void cuda_stats_print(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[CUDA] resident set: %zu tensors, %.2f GB VRAM\n",n,b/1e9);
@@ -325,6 +368,9 @@ static void cuda_stats_print(void){
     if(g_ovl_issue+g_ovl_cpu+g_ovl_take>0) fprintf(stderr,
         "[CUDA] overlap window: pack+issue %.2fs | cpu-rows %.2fs | take(sync+acc) %.2fs\n",
         g_ovl_issue,g_ovl_cpu,g_ovl_take);
+    uint64_t scalls=0; double sgb=0; coli_cuda_stream_stats(&scalls,&sgb);
+    if(scalls) fprintf(stderr,"[CUDA] stream tier: %llu experts streamed (%.2f GB over PCIe)\n",
+        (unsigned long long)scalls,sgb);
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -1534,6 +1580,16 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         s->slab_cap=need;
         if(g_metal_enabled) coli_metal_register(s->slab,need);
 #else
+        /* REPIN guard: a pin reload is always same-layer -> same dims -> same wtot,
+         * so this branch is unreachable for a registered pin (slab_cap already fits)
+         * and this is a no-op in practice. But if a registered slab ever WERE freed
+         * here, the driver's pinned tracking would corrupt (cascade of "invalid
+         * argument"), so drop the page-lock first. stream_unregister early-returns
+         * unless slab_reg==1, and also unregisters the paired fslab. The slot then
+         * streams unregistered until teardown -- safe degradation, never corruption. */
+#ifdef COLI_CUDA
+        stream_unregister(s);
+#endif
         compat_aligned_free(s->slab);
         if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n"); if(fatal) exit(1); s->slab=NULL; s->slab_cap=0; return -1;}
         s->slab_cap=wtot+8192;
@@ -1562,6 +1618,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         s->fslab_cap=ftot;
         if(g_metal_enabled) coli_metal_register(s->fslab,fb);
 #else
+#ifdef COLI_CUDA
+        stream_unregister(s);   /* same REPIN guard as the slab realloc above: unregister a
+                                 * page-locked pin before freeing its fslab. No-op in practice
+                                 * (same-layer reload keeps fslab_cap); idempotent if the slab
+                                 * branch already unregistered this slot. */
+#endif
         free(s->fslab);
         if(fatal){ s->fslab=falloc(ftot); }          /* main path: byte-identical exit-on-OOM */
         else {                                        /* speculative pilot: checked alloc, never exit() */
@@ -2011,6 +2073,10 @@ static inline void pipe_wait(int q){
 #ifdef COLI_CUDA
 static void expert_host_release(Model *m, ESlot *s){
     if(!s->slab&&!s->fslab) return;
+    stream_unregister(s);   /* pin-release chokepoint: a REPIN promotion frees a slab we
+                             * eager-registered, so drop the page-lock before the free.
+                             * No-op for the (unregistered) LRU/demand slabs and for the
+                             * startup VRAM-prefix release (registration happens after). */
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if(s->slab) munlock(s->slab,(size_t)s->slab_cap);
     if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
@@ -2714,6 +2780,110 @@ static int expert_is_resident(Model *m, int layer, int eid){
     for(int z=0;z<m->ecn[layer];z++) if(Sl[z].eid==eid) return 1;
     return 0;
 }
+#ifdef COLI_CUDA
+/* ---- SW: dedicated stream-worker thread (PCIe expert tier) ----------------
+ * Serves resident CPU-side experts on the GPU by streaming their slabs over
+ * PCIe, racing the CPU expert loop through a shared atomic ticket counter:
+ * whoever claims a ticket first computes that expert (worker -> 2-slot GPU
+ * stream ring, main thread -> CPU matmul), so the tier can only help, never
+ * straggle. Tickets the worker claims but cannot serve land in fail_j and the
+ * main thread recomputes them on the CPU after sw_join(). One job in flight
+ * per block; sw_join() runs before the block's stack arrays go out of scope.
+ * Engaged only when STREAM_GB>0 (g_stream_on). */
+typedef struct {
+    ESlot **sl_e; int *sl_j; int nsl; _Atomic int *sl_next;
+    int *fail_j; _Atomic int *nfail;
+    float *es_y; const float *xrow; int sdev; int D;
+} SWJob;
+static struct {
+    pthread_t th; pthread_mutex_t mx; pthread_cond_t cv;
+    int started; int state;                      /* 0 idle, 1 pending, 2 done, 3 quit */
+    SWJob job;
+} g_sw = { .mx=PTHREAD_MUTEX_INITIALIZER, .cv=PTHREAD_COND_INITIALIZER };
+static void sw_run(const SWJob *j){
+    int taken[64],ntaken=0;
+    for(;;){
+        int i=atomic_fetch_add_explicit(j->sl_next,1,memory_order_relaxed);
+        if(i>=j->nsl) break;
+        int jj=j->sl_j[i]; ESlot *e=j->sl_e[i];
+        const uint8_t *wg=e->g.fmt==1?(const uint8_t*)e->g.q8:e->g.q4;
+        const uint8_t *wu=e->u.fmt==1?(const uint8_t*)e->u.q8:e->u.q4;
+        const uint8_t *wd=e->d.fmt==1?(const uint8_t*)e->d.q8:e->d.q4;
+        /* g/u/d and their scales live at these byte offsets inside the packed slab.
+         * Upload the whole slab/fslab (slab_cap already bounds every sub-tensor) and
+         * let the kernel index in — no per-expert extent arithmetic to get wrong. Pins
+         * are page-locked (eager), so their upload is true async DMA; STREAM_PIN=0 LRU
+         * slabs stream unregistered (correct, just not pipelined). */
+        size_t go=(size_t)(wg-e->slab),uo=(size_t)(wu-e->slab),dofs=(size_t)(wd-e->slab);
+        size_t gso=(size_t)(e->g.s-e->fslab),uso=(size_t)(e->u.s-e->fslab),dso=(size_t)(e->d.s-e->fslab);
+        int ok=coli_cuda_expert_stream(j->sdev,e->slab,(size_t)e->slab_cap,
+            e->fslab,(size_t)e->fslab_cap*sizeof(float),
+            go,uo,dofs,gso,uso,dso,e->g.fmt,e->u.fmt,e->d.fmt,
+            1,e->g.I,e->g.O,e->slab_reg==1,j->xrow,j->es_y+(int64_t)jj*j->D);
+        if(!ok){ int f=atomic_fetch_add_explicit(j->nfail,1,memory_order_relaxed); j->fail_j[f]=jj; }
+        else if(ntaken<64) taken[ntaken++]=jj;
+    }
+    if(!coli_cuda_stream_sync(j->sdev))
+        for(int q=0;q<ntaken;q++){ int f=atomic_fetch_add_explicit(j->nfail,1,memory_order_relaxed); j->fail_j[f]=taken[q]; }
+}
+static void *sw_main(void *arg){
+    (void)arg;
+    pthread_mutex_lock(&g_sw.mx);
+    for(;;){
+        while(g_sw.state==0 || g_sw.state==2) pthread_cond_wait(&g_sw.cv,&g_sw.mx);
+        if(g_sw.state==3){ pthread_mutex_unlock(&g_sw.mx); return NULL; }   /* teardown */
+        SWJob j=g_sw.job;
+        pthread_mutex_unlock(&g_sw.mx);
+        sw_run(&j);
+        pthread_mutex_lock(&g_sw.mx);
+        g_sw.state=2;
+        pthread_cond_signal(&g_sw.cv);
+    }
+}
+/* submit the block's stream job; on thread-creation failure fall back to inline
+ * execution (state goes straight to done, sw_join() returns immediately). */
+static void sw_submit(const SWJob *job){
+    pthread_mutex_lock(&g_sw.mx);
+    if(!g_sw.started){
+        if(pthread_create(&g_sw.th,NULL,sw_main,NULL)){
+            fprintf(stderr,"[STREAM] worker thread creation failed, streaming inline\n");
+            g_sw.job=*job; g_sw.state=2;
+            pthread_mutex_unlock(&g_sw.mx);
+            sw_run(job);
+            return;
+        }
+        g_sw.started=1;
+    }
+    g_sw.job=*job; g_sw.state=1;
+    pthread_cond_signal(&g_sw.cv);
+    pthread_mutex_unlock(&g_sw.mx);
+}
+static void sw_join(void){
+    pthread_mutex_lock(&g_sw.mx);
+    while(g_sw.state!=2) pthread_cond_wait(&g_sw.cv,&g_sw.mx);
+    g_sw.state=0;
+    pthread_mutex_unlock(&g_sw.mx);
+}
+/* THE single stream-tier cleanup path (library teardown). Must be called with no
+ * decode in flight. Stops+joins the worker, unregisters the eager pin set, and
+ * releases the device ring. Idempotent. Only pins are ever page-locked — and only
+ * here plus expert_host_release (a REPIN promotion mid-run); LRU/demand slabs stream
+ * unregistered, so their eviction paths need no cleanup at all. */
+static void stream_teardown(Model *m){
+    if(!g_stream_on) return;
+    if(g_sw.started){
+        pthread_mutex_lock(&g_sw.mx);
+        g_sw.state=3;                            /* quit */
+        pthread_cond_signal(&g_sw.cv);
+        pthread_mutex_unlock(&g_sw.mx);
+        pthread_join(g_sw.th,NULL);
+        g_sw.started=0;
+    }
+    for(int l=0;l<=m->c.n_layers;l++)
+        for(int z=0;m->npin && z<m->npin[l];z++) stream_unregister(&m->pin[l][z]);
+    for(int i=0;i<g_cuda_ndev;i++) coli_cuda_stream_shutdown(g_cuda_devices[i]);
+}
+#endif
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
@@ -3023,6 +3193,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
     int *group_row=group_enabled?malloc((size_t)64*S*sizeof(int)):NULL;
     float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
+    /* hybrid stream tier: unweighted per-expert outputs of the ticket race */
+    float *es_y=(group_enabled&&g_stream_on&&g_cuda_enabled&&S==1)?falloc((int64_t)64*D):NULL;
 #endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
@@ -3228,6 +3400,36 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 }
             }
         }
+        /* hybrid stream tier (STREAM_GB>0, S==1): resident CPU-side experts become
+         * tickets raced between the stream worker (GPU over PCIe) and the CPU loop
+         * below; both pull from the same atomic counter, so the tier can only help. */
+        int is_sl[64]={0}; ESlot *sl_e[64]; int sl_j[64]; float slw[64]; int nsl=0;
+        _Atomic int sl_next=0; int fail_j[64]; _Atomic int nfail=0; int sw_used=0;
+        if(es_y && !metal_done && !omp_in_parallel()){
+            for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+                if(qof[j]>=0) continue;                          /* miss: slab still loading */
+                if(early_issued && done_j[j]) continue;          /* already on the GPU group */
+                if(e->g.cuda_eligible&&e->u.cuda_eligible&&e->d.cuda_eligible) continue;
+                float w0=0; int nr=0;
+                for(int kk=0;kk<keff[0];kk++) if(idxs[kk]==eid){ w0=ws[kk]; nr=1; break; }
+                if(!nr) continue;
+                /* resident pin-tier slab, per-row int8/int4 -> streamable. gate/up/down
+                 * share the expert's dims by construction, so no per-slot dim check. */
+                if(e->slab && e->fslab && e->slab_reg!=2
+                   && (!g_stream_pin || (e>=m->pin[layer] && e<m->pin[layer]+m->npin[layer]))
+                   && (e->g.fmt==1||e->g.fmt==2)&&(e->u.fmt==1||e->u.fmt==2)&&(e->d.fmt==1||e->d.fmt==2)
+                   && e->g.s && e->u.s && e->d.s){
+                    slw[j]=w0;
+                    sl_e[nsl]=e; sl_j[nsl]=j; is_sl[j]=1; nsl++;
+                }
+            }
+            if(nsl){
+                SWJob job={sl_e,sl_j,nsl,&sl_next,fail_j,&nfail,es_y,x,
+                           g_cuda_ndev>0?g_cuda_devices[0]:0,D};
+                sw_submit(&job);
+                sw_used=1;
+            }
+        }
 #endif
         /* ---- XEXP=1: one parallel region across ALL experts of the block (S==1, all
          * resident, all int4, IDOT S=1 family active). The default path opens ~2 OpenMP
@@ -3312,6 +3514,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             /* skip the subsets already computed on GPU */
             if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
 #endif
+#ifdef COLI_CUDA
+            if(is_sl[j]) continue;                    /* hybrid: ticket-raced (stream worker vs CPU) */
+#endif
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
@@ -3353,6 +3558,23 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->cpu_expert_rows+=(uint64_t)nr;}
         }
 #ifdef COLI_CUDA
+        /* hybrid race: the worker is streaming its tickets over PCIe; claim the rest
+         * on the CPU through the same counter. Results land unweighted in es_y, like
+         * the streamed ones; everything is accumulated in j order after sw_join(). */
+        if(sw_used){
+            double t0=now_s();
+            for(;;){
+                int ti=atomic_fetch_add_explicit(&sl_next,1,memory_order_relaxed);
+                if(ti>=nsl) break;
+                int jj=sl_j[ti]; ESlot *e=use[jj];
+                expert_gate_up(gg,uu,x,&e->g,&e->u,1);
+                for(int64_t z=0;z<(int64_t)I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(es_y+(int64_t)jj*D,gg,&e->d,1);
+                if(g_prof){ m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                    m->cpu_expert_rows+=1; }
+            }
+            double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_ecpu+=dt;
+        }
         /* Inc.4 take phase: the CPU loop above ran while the GPU computed the issued
          * groups — collect them now. A failed device recomputes its experts on the CPU
          * (expert_host_ensure reloads slabs released by CUDA_RELEASE_HOST). */
@@ -3480,6 +3702,27 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         if(g_prof){double mx=0;for(int di=0;di<g_cuda_ndev;di++)if(dev_time[di]>mx)mx=dev_time[di];m->t_egpu+=mx;}
         m->t_emm+=now_s()-tg;
+        /* hybrid: join the stream worker, recompute on CPU the tickets it claimed but
+         * could not serve, then accumulate every raced expert in j order (single
+         * writer per es_y row). Must complete before the LRU promotion swap below
+         * recycles any slab the worker might still be streaming from. */
+        if(sw_used){
+            double tj=now_s();
+            sw_join();
+            m->t_emm+=now_s()-tj;
+            int nf=atomic_load_explicit(&nfail,memory_order_relaxed);
+            for(int q=0;q<nf;q++){ int jj=fail_j[q]; ESlot *e=use[jj];
+                double t0=now_s();
+                if(!e->slab) expert_host_ensure(m,layer,e);
+                expert_gate_up(gg,uu,x,&e->g,&e->u,1);
+                for(int64_t z=0;z<(int64_t)I;z++) gg[z]=siluf(gg[z])*uu[z];
+                matmul_qt(es_y+(int64_t)jj*D,gg,&e->d,1);
+                double dt=now_s()-t0; m->t_emm+=dt; if(g_prof) m->t_ecpu+=dt;
+            }
+            for(int q2=0;q2<nsl;q2++){ int jj=sl_j[q2]; float w=slw[jj];
+                const float *src=es_y+(int64_t)jj*D;
+                for(int d=0;d<D;d++) out[d]+=w*src[d]; }
+        }
 #endif
         /* No drain barrier: the per-expert pipe_wait(qof[j]) above (issued for every
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
@@ -3529,6 +3772,7 @@ shared_done:
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
+    free(es_y);
     free(group_row); free(group_weight);
 #endif
 }
@@ -5922,6 +6166,23 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
 }
 #endif
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
+#ifdef COLI_CUDA
+/* Eager pin-tier registration (see the stream helpers near the top): page-lock the
+ * stable pin set ONCE, right after it is loaded, so decode never pays a
+ * cudaHostRegister syscall on first use of a hot expert (the old lazy path stalled
+ * the worker on every cold expert). Runs single-threaded before any worker exists,
+ * so slab_reg needs no synchronisation here. STREAM_PIN=0 additionally registers LRU
+ * slabs lazily on the worker; the pins are always eager. */
+static void stream_register_pins(Model *m){
+    if(!g_stream_on) return;
+    int64_t n=0;
+    for(int l=0;l<=m->c.n_layers;l++)
+        for(int z=0;m->npin && z<m->npin[l];z++)
+            if(stream_try_register(&m->pin[l][z])) n++;
+    fprintf(stderr,"[CUDA] stream tier: %lld pin experts pre-registered for DMA (%.1f GB pinned)\n",
+        (long long)n, atomic_load_explicit(&g_stream_reg_bytes,memory_order_relaxed)/1e9);
+}
+#endif
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
     Cfg *c=&m->c; int cap=(c->n_layers+1)*c->n_experts;
@@ -6069,6 +6330,9 @@ static void pin_load(Model *m, const char *statspath, double gb){
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
         m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
+#ifdef COLI_CUDA
+    stream_register_pins(m);                       /* eager page-lock: keep the hot set off the decode path */
+#endif
     free(r); free(cnt_l); free(slot_of); free(next);
 }
 
@@ -6258,6 +6522,14 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
         g_draft,g_pipe,g_direct,g_mmap,g_idot,
         (m->has_dsa&&c->index_topk)?"on":"off",g_pilot,g_cache_route);
 }
+
+#ifdef COLI_CUDA
+/* atexit hook: one registration covers every main() exit path (SERVE, benchmark,
+ * diagnostics). In-process library embedders should call stream_teardown(model) on
+ * model destroy rather than depend on process exit. */
+static Model *g_teardown_model=NULL;
+static void stream_teardown_atexit(void){ if(g_teardown_model) stream_teardown(g_teardown_model); }
+#endif
 
 int main(int argc, char **argv){
     /* ---- Permanent OpenMP hot-thread tuning. The per-expert matmul regions are
@@ -6501,6 +6773,14 @@ int main(int argc, char **argv){
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
+    if(g_cuda_enabled){
+        if(getenv("STREAM_GB")) g_stream_budget_gb=atof(getenv("STREAM_GB"));
+        if(getenv("STREAM_PIN")) g_stream_pin=atoi(getenv("STREAM_PIN"))!=0;
+        g_stream_on = g_stream_budget_gb>0 && coli_cuda_stream_supported();
+        if(g_stream_on) fprintf(stderr,"[CUDA] stream tier: PCIe expert streaming on "
+            "(STREAM_GB=%.1f pinned budget, %s; STREAM_GB=0 to disable)\n",
+            g_stream_budget_gb,g_stream_pin?"pin tier only":"pin+LRU");
+    }
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
@@ -6648,6 +6928,9 @@ int main(int argc, char **argv){
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
+#ifdef COLI_CUDA
+    if(g_stream_on){ g_teardown_model=&m; atexit(stream_teardown_atexit); }   /* single cleanup path */
+#endif
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
     if(getenv("SCORE")){ run_score(&m, snap, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }

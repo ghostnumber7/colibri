@@ -116,6 +116,33 @@ COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
+/* ---- streamed warm experts (PCIe tier) ------------------------------------
+ * Serves a CPU-resident expert on the GPU: uploads its packed slab + scales to
+ * a dedicated per-slot stream and runs the expert MLP from VRAM — adding PCIe
+ * bandwidth next to the CPU's DRAM path. Host buffers should be page-pinned
+ * via coli_cuda_host_register for true async DMA (unregistered slabs still
+ * work, just slower). expert_stream ENQUEUES into a 2-slot ring (slot k+1's
+ * upload overlaps slot k's kernels); the y writeback of a slot completes when
+ * the slot is reused or at coli_cuda_stream_sync, which drains the ring.
+ * stream_supported lets the host probe an older DLL that lacks these exports. */
+COLI_CUDA_DLLEXPORT int coli_cuda_stream_supported(void);
+COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
+/* `registered`=1 means the host slab/fslab are page-pinned (cudaHostRegister'd) and
+ * DMA directly; =0 (churning LRU slabs) stages them through a pinned bounce buffer so
+ * the H2D still runs as true async DMA instead of a synchronous pageable copy. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_stream(int device,
+        const void *slab, size_t slab_bytes,
+        const float *fslab, size_t fslab_bytes,
+        size_t g_off, size_t u_off, size_t d_off,
+        size_t gs_off, size_t us_off, size_t ds_off,
+        int gf, int uf, int df,
+        int rows, int D, int I, int registered,
+        const float *x, float *y);
+COLI_CUDA_DLLEXPORT int coli_cuda_stream_sync(int device);
+COLI_CUDA_DLLEXPORT void coli_cuda_stream_stats(uint64_t *calls, double *gbytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_stream_shutdown(int device);
+
 /* Replace a resident tensor's contents without reallocating its device slot. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                             const void *weights, const float *scales);

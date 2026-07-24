@@ -46,6 +46,18 @@ typedef int            (*fn_expert_group_issue)(ColiCudaTensor *const *gates,
                                                 ColiCudaTensor *const *downs,
                                                 const int *rows, int count, const float *x);
 typedef const float *  (*fn_expert_group_take)(int device);
+typedef int (*fn_stream_supported)(void);
+typedef int (*fn_host_register)(void *p, size_t bytes);
+typedef void (*fn_host_unregister)(void *p);
+typedef int (*fn_expert_stream)(int device, const void *slab, size_t slab_bytes,
+        const float *fslab, size_t fslab_bytes,
+        size_t g_off, size_t u_off, size_t d_off,
+        size_t gs_off, size_t us_off, size_t ds_off,
+        int gf, int uf, int df, int rows, int D, int I, int registered,
+        const float *x, float *y);
+typedef int (*fn_stream_sync)(int device);
+typedef void (*fn_stream_stats)(uint64_t *calls, double *gbytes);
+typedef void (*fn_stream_shutdown)(int device);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
                                               int R, int V, int K, int T, float attention_scale);
@@ -111,6 +123,16 @@ static struct {
     fn_expert_group    expert_group;
     fn_expert_group_issue expert_group_issue;
     fn_expert_group_take expert_group_take;
+
+    /* streamed warm experts — OPTIONAL: resolved best-effort so an older
+     * coli_cuda.dll without these exports keeps working (streaming disabled). */
+    fn_stream_supported stream_supported;
+    fn_host_register    host_register;
+    fn_host_unregister  host_unregister;
+    fn_expert_stream    expert_stream;
+    fn_stream_sync      stream_sync;
+    fn_stream_stats     stream_stats;
+    fn_stream_shutdown  stream_shutdown;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
@@ -248,6 +270,28 @@ static int coli_cuda_load(void){
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
     #undef RESOLVE
+
+    /* Optional symbols: NULL just disables the streamed-expert tier. */
+    #define RESOLVE_OPT(name, type) \
+        _Pragma("GCC diagnostic push") \
+        _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"") \
+        g_cuda.name = (type)GetProcAddress(g_cuda.dll, "coli_cuda_" #name); \
+        _Pragma("GCC diagnostic pop")
+    RESOLVE_OPT(stream_supported, fn_stream_supported)
+    RESOLVE_OPT(host_register,    fn_host_register)
+    RESOLVE_OPT(host_unregister,  fn_host_unregister)
+    RESOLVE_OPT(expert_stream,    fn_expert_stream)
+    RESOLVE_OPT(stream_sync,      fn_stream_sync)
+    RESOLVE_OPT(stream_stats,     fn_stream_stats)
+    RESOLVE_OPT(stream_shutdown,  fn_stream_shutdown)
+    #undef RESOLVE_OPT
+    if(!(g_cuda.stream_supported && g_cuda.host_register && g_cuda.host_unregister &&
+         g_cuda.expert_stream && g_cuda.stream_sync && g_cuda.stream_stats &&
+         g_cuda.stream_shutdown)){
+        g_cuda.stream_supported=NULL;   /* all-or-nothing: partial sets are treated as absent */
+        fprintf(stderr, "[CUDA] coli_cuda.dll predates the stream tier; expert streaming disabled "
+                        "(rebuild the DLL with build_cuda.bat to enable it).\n");
+    }
 
     g_cuda.available = 1;
     return 1;
@@ -509,6 +553,46 @@ int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCud
 int coli_cuda_tensor_update(ColiCudaTensor *tensor, const void *weights, const float *scales){
     if(!g_cuda.available){ return 0; }
     return g_cuda.tensor_update(tensor, weights, scales);
+}
+
+int coli_cuda_stream_supported(void){
+    if(!g_cuda.available || !g_cuda.stream_supported){ return 0; }
+    return g_cuda.stream_supported();
+}
+
+int coli_cuda_host_register(void *p, size_t bytes){
+    if(!g_cuda.available || !g_cuda.host_register){ return 0; }
+    return g_cuda.host_register(p, bytes);
+}
+
+void coli_cuda_host_unregister(void *p){
+    if(g_cuda.available && g_cuda.host_unregister) g_cuda.host_unregister(p);
+}
+
+int coli_cuda_expert_stream(int device, const void *slab, size_t slab_bytes,
+        const float *fslab, size_t fslab_bytes,
+        size_t g_off, size_t u_off, size_t d_off,
+        size_t gs_off, size_t us_off, size_t ds_off,
+        int gf, int uf, int df, int rows, int D, int I, int registered,
+        const float *x, float *y){
+    if(!g_cuda.available || !g_cuda.expert_stream){ return 0; }
+    return g_cuda.expert_stream(device, slab, slab_bytes, fslab, fslab_bytes,
+        g_off, u_off, d_off, gs_off, us_off, ds_off, gf, uf, df, rows, D, I, registered, x, y);
+}
+
+int coli_cuda_stream_sync(int device){
+    if(!g_cuda.available || !g_cuda.stream_sync){ return 0; }
+    return g_cuda.stream_sync(device);
+}
+
+void coli_cuda_stream_stats(uint64_t *calls, double *gbytes){
+    if(!g_cuda.available || !g_cuda.stream_stats){ if(calls)*calls=0; if(gbytes)*gbytes=0; return; }
+    g_cuda.stream_stats(calls, gbytes);
+}
+
+void coli_cuda_stream_shutdown(int device){
+    if(!g_cuda.available || !g_cuda.stream_shutdown){ return; }
+    g_cuda.stream_shutdown(device);
 }
 
 #endif /* _WIN32 */

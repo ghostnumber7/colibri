@@ -484,6 +484,10 @@ static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
+static int reserve_pinned_v(void **ptr,size_t *cap,size_t bytes){   /* void* variant for the slab bounce */
+    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned bounce allocation"))return 0;*cap=bytes;return 1;
+}
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
@@ -992,6 +996,153 @@ extern "C" const float *coli_cuda_expert_group_take(int device) {
     return ctx->host_y;
 }
 
+/* ---- streamed warm experts (PCIe tier) ------------------------------------
+ * 2-slot ring per device, one non-blocking stream per slot: while slot A's
+ * kernels run, slot B's slab upload DMAs — the copy engine and SMs overlap, so
+ * sustained throughput is bounded by PCIe, not by the sum of copy+compute.
+ * Single producer (the engine's stream-worker thread); no locking. */
+typedef struct {
+    cudaStream_t stream; cudaEvent_t done;
+    void *slab; size_t slab_cap;                 /* device: packed weights */
+    float *fslab; size_t fslab_cap;              /* device: scales */
+    float *x,*gate,*y; size_t x_cap,gate_cap,y_cap;
+    float *hx,*hy; size_t hx_cap,hy_cap;         /* pinned staging */
+    void *hslab; size_t hslab_cap;               /* pinned bounce for UNREGISTERED (LRU) slabs */
+    float *hfslab; size_t hfslab_cap;            /* pinned bounce for their scales */
+    float *dst; size_t ybytes; int busy;         /* pending writeback */
+} StreamSlot;
+typedef struct { StreamSlot slot[2]; int next; int inited;
+    uint64_t calls; double gbytes; } StreamCtx;   /* stats: worker-local, no lock */
+static StreamCtx g_stream_ctx[COLI_CUDA_MAX_DEVICES];
+
+static int stream_slot_drain(StreamSlot *sl){
+    if(!sl->busy) return 1;
+    if(!cuda_ok(cudaEventSynchronize(sl->done),"expert stream drain")) return 0;
+    std::memcpy(sl->dst,sl->hy,sl->ybytes);
+    sl->busy=0; return 1;
+}
+
+extern "C" int coli_cuda_stream_supported(void){ return 1; }
+
+extern "C" int coli_cuda_host_register(void *p, size_t bytes){
+    if(!p||!bytes) return 0;
+    cudaError_t e=cudaHostRegister(p,bytes,cudaHostRegisterPortable);
+    if(e==cudaErrorHostMemoryAlreadyRegistered){ cudaGetLastError(); return 1; }
+    if(e!=cudaSuccess){ cudaGetLastError(); return 0; }   /* quiet: caller falls back */
+    return 1;
+}
+extern "C" void coli_cuda_host_unregister(void *p){
+    if(p){ cudaHostUnregister(p); cudaGetLastError(); }
+}
+
+extern "C" int coli_cuda_expert_stream(int device,
+        const void *slab, size_t slab_bytes,
+        const float *fslab, size_t fslab_bytes,
+        size_t g_off, size_t u_off, size_t d_off,
+        size_t gs_off, size_t us_off, size_t ds_off,
+        int gf, int uf, int df,
+        int rows, int D, int I, int registered,
+        const float *x, float *y){
+    if(!slab||!fslab||!x||!y||rows<1||D<1||I<1) return 0;
+    if((gf!=1&&gf!=2)||(uf!=1&&uf!=2)||(df!=1&&df!=2)) return 0;  /* per-row int8/int4 only */
+    DeviceContext *ctx=find_ctx(device); if(!ctx||!select_ctx(ctx)) return 0;
+    StreamCtx *sc=&g_stream_ctx[(int)(ctx-g_ctx)];
+    if(!sc->inited){
+        for(int k=0;k<2;k++){
+            if(!cuda_ok(cudaStreamCreateWithFlags(&sc->slot[k].stream,cudaStreamNonBlocking),"stream create")||
+               !cuda_ok(cudaEventCreateWithFlags(&sc->slot[k].done,cudaEventDisableTiming),"stream event")) return 0;
+        }
+        sc->inited=1;
+    }
+    StreamSlot *sl=&sc->slot[sc->next]; sc->next^=1;
+    if(!stream_slot_drain(sl)) return 0;                 /* completes the slot's previous expert */
+    if(!reserve_bytes(&sl->slab,&sl->slab_cap,slab_bytes)||
+       !reserve(&sl->fslab,&sl->fslab_cap,fslab_bytes)) return 0;
+    size_t xb=(size_t)rows*D*sizeof(float), ib=(size_t)rows*I*sizeof(float);
+    if(!reserve(&sl->x,&sl->x_cap,xb)||!reserve(&sl->gate,&sl->gate_cap,2*ib)||
+       !reserve(&sl->y,&sl->y_cap,xb)||
+       !reserve_pinned(&sl->hx,&sl->hx_cap,xb)||!reserve_pinned(&sl->hy,&sl->hy_cap,xb)) return 0;
+    std::memcpy(sl->hx,x,xb);
+    cudaStream_t st=sl->stream;
+    /* Registered (pin) slabs DMA straight from their page-locked host buffer. An
+     * unregistered LRU slab is pageable -- a direct cudaMemcpyAsync on it degrades to a
+     * SYNCHRONOUS staged copy (blocks the worker, no overlap), so stage it through the
+     * slot's pinned bounce buffer first: the memcpy overlaps the prior slot's kernels and
+     * the H2D becomes true async DMA. The drain above guarantees the bounce is free. */
+    const void *slab_src=slab; const float *fslab_src=fslab;
+    if(!registered){
+        if(!reserve_pinned_v(&sl->hslab,&sl->hslab_cap,slab_bytes)||
+           !reserve_pinned(&sl->hfslab,&sl->hfslab_cap,fslab_bytes)) return 0;
+        std::memcpy(sl->hslab,slab,slab_bytes);
+        std::memcpy(sl->hfslab,fslab,fslab_bytes);
+        slab_src=sl->hslab; fslab_src=sl->hfslab;
+    }
+    if(!cuda_ok(cudaMemcpyAsync(sl->slab,slab_src,slab_bytes,cudaMemcpyHostToDevice,st),"stream slab upload")||
+       !cuda_ok(cudaMemcpyAsync(sl->fslab,fslab_src,fslab_bytes,cudaMemcpyHostToDevice,st),"stream scales upload")||
+       !cuda_ok(cudaMemcpyAsync(sl->x,sl->hx,xb,cudaMemcpyHostToDevice,st),"stream x upload")) return 0;
+    uint8_t *ds8=(uint8_t*)sl->slab; const float *dsc=sl->fslab;
+    float *up=sl->gate+(size_t)rows*I;
+    /* host slabs store int4 as OFFSET nibbles ((n&15)-8); weight_at reads SIGNED
+     * two's-complement — same ^0x88 conversion the VRAM upload path applies. */
+    if(gf==2){ size_t n=(size_t)I*row_bytes(2,D); offset_to_signed_s4<<<(unsigned)((n+255)/256),256,0,st>>>(ds8+g_off,n); }
+    if(uf==2){ size_t n=(size_t)I*row_bytes(2,D); offset_to_signed_s4<<<(unsigned)((n+255)/256),256,0,st>>>(ds8+u_off,n); }
+    if(df==2){ size_t n=(size_t)D*row_bytes(2,I); offset_to_signed_s4<<<(unsigned)((n+255)/256),256,0,st>>>(ds8+d_off,n); }
+    quant_matmul<<<dim3((unsigned)I,(unsigned)rows),256,0,st>>>(sl->gate,sl->x,ds8+g_off,dsc+gs_off,gf,rows,D,I,row_bytes(gf,D),0,0);
+    quant_matmul<<<dim3((unsigned)I,(unsigned)rows),256,0,st>>>(up,sl->x,ds8+u_off,dsc+us_off,uf,rows,D,I,row_bytes(uf,D),0,0);
+    silu_mul<<<(unsigned)(((size_t)rows*I+255)/256),256,0,st>>>(sl->gate,up,(size_t)rows*I);
+    quant_matmul<<<dim3((unsigned)D,(unsigned)rows),256,0,st>>>(sl->y,sl->gate,ds8+d_off,dsc+ds_off,df,rows,I,D,row_bytes(df,I),0,0);
+    if(!cuda_ok(cudaGetLastError(),"stream kernel launch")||
+       !cuda_ok(cudaMemcpyAsync(sl->hy,sl->y,xb,cudaMemcpyDeviceToHost,st),"stream y download")||
+       !cuda_ok(cudaEventRecord(sl->done,st),"stream event record")) return 0;
+    sl->dst=y; sl->ybytes=xb; sl->busy=1;
+    sc->calls++; sc->gbytes+=(double)(slab_bytes+fslab_bytes)/1e9;   /* single producer: no lock */
+    return 1;
+}
+
+extern "C" int coli_cuda_stream_sync(int device){
+    DeviceContext *ctx=find_ctx(device); if(!ctx) return 0;
+    StreamCtx *sc=&g_stream_ctx[(int)(ctx-g_ctx)];
+    if(!sc->inited) return 1;
+    int ok=1;
+    for(int k=0;k<2;k++) ok&=stream_slot_drain(&sc->slot[k]);
+    return ok;
+}
+
+extern "C" void coli_cuda_stream_stats(uint64_t *calls, double *gbytes){
+    uint64_t c=0; double g=0;
+    for(int i=0;i<COLI_CUDA_MAX_DEVICES;i++){ c+=g_stream_ctx[i].calls; g+=g_stream_ctx[i].gbytes; }
+    if(calls)  *calls=c;
+    if(gbytes) *gbytes=g;
+}
+
+/* Release the device's stream ring: drain any pending writeback, destroy the two
+ * streams+events, free the device scratch and pinned staging. Idempotent; the ring
+ * re-inits on the next coli_cuda_expert_stream. Call at engine/model teardown (the
+ * host worker thread must already be joined so no stream call is in flight). */
+extern "C" void coli_cuda_stream_shutdown(int device){
+    DeviceContext *ctx=find_ctx(device); if(!ctx) return;
+    StreamCtx *sc=&g_stream_ctx[(int)(ctx-g_ctx)];
+    if(!sc->inited) return;
+    select_ctx(ctx);
+    for(int k=0;k<2;k++){
+        StreamSlot *sl=&sc->slot[k];
+        stream_slot_drain(sl);                      /* flush the last writeback */
+        if(sl->stream) cudaStreamDestroy(sl->stream);
+        if(sl->done)   cudaEventDestroy(sl->done);
+        if(sl->slab)   cudaFree(sl->slab);
+        if(sl->fslab)  cudaFree(sl->fslab);
+        if(sl->x)      cudaFree(sl->x);
+        if(sl->gate)   cudaFree(sl->gate);
+        if(sl->y)      cudaFree(sl->y);
+        if(sl->hx)     cudaFreeHost(sl->hx);
+        if(sl->hy)     cudaFreeHost(sl->hy);
+        if(sl->hslab)  cudaFreeHost(sl->hslab);
+        if(sl->hfslab) cudaFreeHost(sl->hfslab);
+        std::memset(sl,0,sizeof(*sl));
+    }
+    cudaGetLastError();
+    sc->next=0; sc->inited=0;                        /* counters kept for post-mortem stats */
+}
 
 extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const float *q,
                                             const float *latent,const float *rope,int H,int Q,

@@ -97,6 +97,8 @@ Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRE
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. |
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. |
 | `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
+| `STREAM_GB` | `0` (off) | Pinned-host budget (GB) for the PCIe expert streaming tier: resident CPU-side experts become tickets raced between a dedicated stream-worker thread (GPU over PCIe, 2-slot ring) and the CPU expert loop — adding a GPU/PCIe compute path alongside the CPU/DRAM one. Registering host slabs for DMA page-locks up to this many GB of RAM (unavailable to the page cache while pinned). |
+| `STREAM_PIN` | `1` | `1` streams only pin-tier slabs (already mlock-wired, so registration pins no additional pages); `0` also opens the LRU slabs — more experts become streamable, but registering them page-locks previously-unwired pages, further reducing the page cache. Only consulted when `STREAM_GB>0`. |
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
