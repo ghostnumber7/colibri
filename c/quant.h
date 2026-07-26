@@ -164,19 +164,31 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+/* One group scale, read at its IN-RAM width. QS_BF16 keeps a streaming expert's .qs
+ * sidecar in the bf16 the container already stores instead of widening the whole array
+ * to f32 at load: the scales are ~20% of the bytes this kernel pulls from DRAM
+ * (22.02 MB of nibbles vs 5.505 MB of f32 scales per routed row), and they are read once
+ * per `gs`=32 weights, so widening one scalar in-register costs nothing next to halving
+ * that traffic. bf16 -> f32 is an exact widening (the low 16 mantissa bits are zero), so
+ * the value handed to the FMA is bit-identical either way. */
+static inline float qs_at(const void *scale, int64_t idx, int s_bf16){
+    return s_bf16 ? bf16_to_f32(((const uint16_t*)scale)[idx])
+                  : ((const float*)scale)[idx];
+}
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
-static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
-                              int S, int I, int O, int gs){
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const void *scale,
+                              int S, int I, int O, int gs, int s_bf16){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *w=q4+(int64_t)o*rb;
-        const float *scl=scale+(int64_t)o*ng;
+        int64_t sbase=(int64_t)o*ng;
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I; float a=0;
             for(int g=0; g*gs<I; g++){
                 int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
-                float sc=scl[g];
+                float sc=qs_at(scale,sbase+g,s_bf16);
                 int i=base;
 #ifdef __AVX2__
                 const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);

@@ -19,7 +19,13 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",c->first_dense,suf[k]);
             eb+=st_nbytes(&m->S,nm);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",c->first_dense,suf[k]);
-            int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
+            int64_t q=st_nbytes(&m->S,nm);
+            /* q is the sidecar's ON-DISK bytes, which for a BF16 .qs (Kimi-K2, 2B/scale)
+             * is HALF the resident F32 bytes fslab actually holds after qscales_upcast --
+             * undercounting eb here undercounts npin's per-expert cost (#229: this is the
+             * exact RAM-ceiling-OOM failure mode, just from the other direction: previously
+             * an unrelated 2x under-ALLOCATION, here a 2x under-COUNT that over-PINS). */
+            if(q>0) eb += (st_dtype(&m->S,nm)==2 ? q : q*2);
         }
     }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);

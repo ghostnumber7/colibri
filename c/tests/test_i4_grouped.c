@@ -73,8 +73,39 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
     for(int i=0;i<O*ng;i++) scale[i]=(0.001f+(float)(xr()%1000)/1000.0f)*((xr()&1)?1.f:-1.f);
     for(int i=0;i<S*I;i++) x[i]=frand();
 
-    matmul_i4_grouped(y,x,q4,scale,S,I,O,gs);
+    matmul_i4_grouped(y,x,q4,scale,S,I,O,gs,0);
     ref_grouped(yr,ym,x,q4,scale,S,I,O,gs);
+
+    /* QS_BF16 bit-identity: the kernel may read its group scales as bf16 (kept at the
+     * container's stored width in RAM) instead of f32 widened at load. bf16 -> f32 is an
+     * EXACT widening -- the low 16 mantissa bits are zero -- so both readings must hand
+     * the FMA the identical float and produce BIT-IDENTICAL output, not merely output
+     * within the tolerance used above. Construct the comparison so bf16 is the source of
+     * truth on both sides: truncate each scale to bf16, widen that back to f32, and run
+     * the f32 arm on the widened values. Any difference here is a real defect (a wrong
+     * stride, an index computed in float units, a byte-order slip), never rounding. */
+    {
+        uint16_t *sb=malloc((size_t)O*ng*sizeof(uint16_t));
+        float *sw=malloc((size_t)O*ng*sizeof(float));
+        float *yb=malloc((size_t)S*O*sizeof(float));
+        float *yf=malloc((size_t)S*O*sizeof(float));
+        if(!sb||!sw||!yb||!yf){ fprintf(stderr,"%s: OOM (bf16)\n",name); return 1; }
+        for(int i=0;i<O*ng;i++){
+            uint32_t u; memcpy(&u,&scale[i],4);
+            sb[i]=(uint16_t)(u>>16);                 /* truncate toward zero to bf16 */
+            sw[i]=bf16_to_f32(sb[i]);                /* the exact value both arms must use */
+        }
+        matmul_i4_grouped(yb,x,q4,sb,S,I,O,gs,1);    /* scales read as bf16 */
+        matmul_i4_grouped(yf,x,q4,sw,S,I,O,gs,0);    /* same values, read as f32 */
+        for(int i=0;i<S*O;i++){
+            if(memcmp(&yb[i],&yf[i],sizeof(float))!=0){
+                fprintf(stderr,"%s: QS_BF16 mismatch at %d: bf16=%.9g f32=%.9g\n",
+                        name,i,(double)yb[i],(double)yf[i]);
+                free(sb);free(sw);free(yb);free(yf); return 1;
+            }
+        }
+        free(sb);free(sw);free(yb);free(yf);
+    }
 
     int bad=0; double worst=0;
     for(int i=0;i<S*O;i++){

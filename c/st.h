@@ -515,6 +515,12 @@ static int64_t st_numel(shards *S, const char *name) {
 static int64_t st_nbytes(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
 }
+/* declared dtype of a tensor (0=BF16 1=F16 2=F32 3=U8/I8), or -1 if absent.
+ * Lets callers normalize byte counts for scale sidecars (.qs) that may be
+ * stored in a narrower float format than F32 (e.g. Kimi-K2's bf16 scales). */
+static int st_dtype(shards *S, const char *name) {
+    st_tensor *t = st_find(S, name); return t ? t->dtype : -1;
+}
 
 /* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
  * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */

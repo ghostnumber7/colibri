@@ -93,6 +93,27 @@ typedef struct {
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
+    char model_type[32];                          /* config.json "model_type", e.g. "kimi_k2".
+                                                    * Selects the chat template at the prompt-building
+                                                    * sites -- a plain string compare, no arch enum. */
+    float rope_beta_fast;                          /* config.json rope_scaling.beta_fast, 1.0 if no
+                                                    * yarn block at all (GLM). FALLBACK discriminator
+                                                    * for K2.6 vs K2-Thinking when source_variant below
+                                                    * is empty -- see mt_is_k26 in sample.h. Set by
+                                                    * rope_table_init(). */
+    char source_variant[24];                       /* config.json "_colibri_source_variant", e.g.
+                                                    * "kimi_k25". Stamped by the converter's
+                                                    * _write_config_file only when it flattened a
+                                                    * K2.6-style nested source (see
+                                                    * convert_fp8_to_int4.py) -- a structural fact about
+                                                    * which container this is, unlike rope_beta_fast
+                                                    * (a YaRN tuning value with no semantic tie to
+                                                    * template choice, kept only as a fallback for
+                                                    * containers converted before this marker existed).
+                                                    * Empty string ("") when absent, e.g. K2-Thinking,
+                                                    * GLM, or an older K2.6 container -- mt_is_k26 then
+                                                    * falls back to rope_beta_fast. Plain string compare,
+                                                    * no arch enum. */
 } Cfg;
 
 /* tensore [O,I] in uno di tre formati:
@@ -112,6 +133,10 @@ typedef struct {
  * bits/weight effective — the quality/size sweet spot measured in the #132 ablation. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
+    /* QS_BF16: `s` points at bf16 scales (2B each), NOT f32 -- read only via qs_at().
+     * Set only for streaming fmt=4 experts whose container stores bf16 .qs; residents
+     * and every f32-sidecar container keep 0, so their code paths are unchanged. */
+    int s_bf16;
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -164,7 +189,15 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  /* pin-arena backing (#419): when set, slab/fslab are interior
                   * slices of a per-layer arena and must never be free()d —
                   * expert_host_release detaches them, expert_host_ensure
-                  * re-attaches. NULL for every individually-allocated slot. */
+                  * re-attaches. NULL for every individually-allocated slot.
+                  * INDEPENDENT of each other: aslab tracks slab, afslab tracks
+                  * fslab, and either can be NULL while the other is set --
+                  * expert_load_impl's slab and fslab realloc guards are two
+                  * separate blocks, so an oversized expert can detach (escape
+                  * to an individual allocation) only its weight buffer, or only
+                  * its scale buffer, leaving the other still arena-owned. Every
+                  * site touching these MUST test aslab and afslab separately,
+                  * never infer one from the other. */
                  uint8_t *aslab; float *afslab; } ESlot;
 
 typedef struct {
@@ -243,6 +276,10 @@ typedef struct {
     uint64_t route_agree_hit, route_agree_tot;    /* ROUTE_AGREE: |chosen ∩ true top-K| / K */
     double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
     double t_ewait, t_emm, t_ecpu, t_egpu, t_route, t_p2p, t_attn, t_kvb, t_head;
+    double t_pilotw;                             /* moe() entry barrier: wait on in-flight
+                                                  * PILOT_REAL cross-layer loads. Counted
+                                                  * nowhere else, so it used to land in
+                                                  * PROFILE's `other` residual. */
     uint64_t n_p2p;                              /* P0 execution profile: tier split + residual hops */
     uint64_t cpu_expert_rows; int64_t cpu_expert_bytes;
                                                  /* profiling: dove va il tempo (wall del
@@ -269,15 +306,16 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,
 
 /* fmt=4 fused gate+up (defined later, after the quant kernels) */
 static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
-                                    const uint8_t *qg, const float *sg,
-                                    const uint8_t *qu, const float *su,
-                                    int S, int I, int O, int gs);
+                                    const uint8_t *qg, const void *sg,
+                                    const uint8_t *qu, const void *su,
+                                    int S, int I, int O, int gs, int s_bf16);
 
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
     if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
-    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
-        matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
+    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs
+            &&wg->s_bf16==wu->s_bf16)   /* one s_bf16 is passed for both -- never pair a mixed-width pair */
+        matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs,wg->s_bf16);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
 
@@ -302,11 +340,26 @@ static int qt_cuda_upload(QT *t){
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
-    if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
+    if(t->fmt==4){  /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
                      * upload would truncate them to O floats and the group kernels
                      * would read garbage. An old DLL without the _g symbol returns 0
                      * and the tensor simply stays CPU-side. */
+        if(t->s_bf16){
+            /* QS_BF16 keeps this expert's scales bf16 in RAM, but the device kernels take
+             * f32. Widen into a throwaway buffer for the upload only: this runs once per
+             * expert placed in VRAM, never on the decode path, so it costs nothing that
+             * the halved host-side traffic doesn't already repay. Failing the upload on
+             * OOM leaves the tensor CPU-side, which is the same fallback an old DLL gets. */
+            int64_t ng=(t->I+t->gs-1)/t->gs, n=(int64_t)t->O*ng;
+            float *tmp=malloc((size_t)n*sizeof(float));
+            if(!tmp) return 0;
+            for(int64_t i=0;i<n;i++) tmp[i]=bf16_to_f32(((const uint16_t*)t->s)[i]);
+            int ok=coli_cuda_tensor_upload_g(&t->cuda,weights,tmp,t->fmt,t->I,t->O,t->cuda_device,t->gs);
+            free(tmp);
+            return ok;
+        }
         return coli_cuda_tensor_upload_g(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device,t->gs);
+    }
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
 static int qt_cuda_update(QT *t){
@@ -456,7 +509,7 @@ static uint64_t g_prof_nlat;                     /* forwards recorded (monotonic
 static void prof_lat(double s){ g_prof_lat[g_prof_nlat++ % PROF_LAT_CAP]=s; }
 /* snapshot for windowed reports (serve mode: one report per turn) */
 typedef struct {
-    double edisk,ewait,emm,ecpu,egpu,route,p2p,attn,head;
+    double edisk,ewait,emm,ecpu,egpu,route,p2p,attn,head,pilotw;
     int64_t io,cpu_bytes; uint64_t hits,miss,ereq,n_fw,n_emit,nlat,n_p2p,cpu_rows;
     uint64_t hit_pin,hit_ecache;
     uint64_t dc_n[2], dc_direct_n[2]; int64_t dc_bytes[2], dc_ns[2]; /* DISK-CLASS */
@@ -465,7 +518,7 @@ typedef struct {
 static void prof_base(Model *m, ProfBase *b){
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
     b->ecpu=m->t_ecpu; b->egpu=m->t_egpu; b->route=m->t_route; b->p2p=m->t_p2p;
-    b->attn=m->t_attn; b->head=m->t_head;
+    b->attn=m->t_attn; b->head=m->t_head; b->pilotw=m->t_pilotw;
     b->io=atomic_load_explicit(&g_prof_io,memory_order_relaxed);
     b->hits=m->hits; b->miss=m->miss; b->ereq=m->ereq;
     b->hit_pin=m->hit_pin; b->hit_ecache=m->hit_ecache;
@@ -511,20 +564,20 @@ static void *xzalloc(size_t n, const char *what){
  * the same x[S,I], reading x once instead of twice — saves ~33% of expert-matmul time at decode.
  * The per-group scale logic matches matmul_i4_grouped exactly. */
 static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
-                                    const uint8_t *qg, const float *sg,
-                                    const uint8_t *qu, const float *su,
-                                    int S, int I, int O, int gs){
+                                    const uint8_t *qg, const void *sg,
+                                    const uint8_t *qu, const void *su,
+                                    int S, int I, int O, int gs, int s_bf16){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *wg=qg+(int64_t)o*rb; const uint8_t *wu2=qu+(int64_t)o*rb;
-        const float *sgl=sg+(int64_t)o*ng;   const float *sul=su+(int64_t)o*ng;
+        int64_t sbase=(int64_t)o*ng;
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I;
             float ag=0, au=0;
             for(int g=0; g*gs<I; g++){
                 int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
-                float scg=sgl[g], scu=sul[g];
+                float scg=qs_at(sg,sbase+g,s_bf16), scu=qs_at(su,sbase+g,s_bf16);
                 int i=base;
 #ifdef __AVX2__
                 const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
@@ -588,7 +641,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
-    if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
+    if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs,w->s_bf16); return; }
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
@@ -858,6 +911,119 @@ static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
 
+/* Rotary frequency table. Filled once by rope_table_init() from config.json and
+ * read by rope_interleave instead of calling powf per position. With no
+ * rope_scaling block the table holds exactly theta^(-2j/qk_rope) -- the same
+ * expression the engine computed inline before -- so GLM containers are
+ * bit-identical. qk_rope <= 256 is enforced below, so half <= 128. */
+static float g_inv_freq[128];
+static int   g_inv_freq_n = 0;
+static int   g_yarn = 0;            /* 1 = YaRN frequencies are in the table */
+static float g_yarn_mscale = 1.0f;  /* multiplies cos/sin; 1.0 without YaRN */
+
+/* DeepseekV3YarnRotaryEmbedding helpers, in double so the floor/ceil of the
+ * correction range lands on the same integers as the Python reference. */
+static double yarn_correction_dim(double nrot, int dim, double base, double orig_max){
+    return (dim * log(orig_max / (nrot * 2.0 * 3.14159265358979323846))) / (2.0 * log(base));
+}
+static double yarn_get_mscale(double scale, double mscale){
+    if(scale <= 1.0) return 1.0;
+    return 0.1 * mscale * log(scale) + 1.0;
+}
+static void rope_table_init(Cfg *c, jval *r){
+    int dim = c->qk_rope, half = dim/2;
+    if(dim > 256){ fprintf(stderr,"qk_rope=%d exceeds the rope table (256)\n",dim); exit(1); }
+    g_inv_freq_n = half; g_yarn = 0; g_yarn_mscale = 1.0f;
+    c->rope_beta_fast = 1.0f;           /* default: no yarn block (GLM) / step-not-ramp (K2-Thinking) */
+    for(int j=0;j<half;j++) g_inv_freq[j] = powf(c->theta, -2.0f*j/(float)dim);
+
+    jval *sc = json_get(r,"rope_scaling");
+    if(!sc || sc->t != J_OBJ){
+        /* transformers 5.x renamed the legacy rope_scaling/rope_theta keys to a
+         * unified rope_parameters block, and to_dict() on such a config omits
+         * rope_scaling entirely. A config written that way (unlike the test
+         * fixtures, which always re-emit the legacy rope_scaling block for the
+         * engine) would carry its YaRN parameters ONLY under rope_parameters --
+         * and since we only look at rope_scaling above, it would silently run
+         * unscaled: out-of-distribution at every position, no error. GLM's own
+         * rope_parameters is {"rope_type":"default",...}, which carries no
+         * scaling info and must keep working silently. Anything else under
+         * rope_parameters is a config format this engine does not interpret:
+         * refuse instead of guessing. */
+        jval *rp = json_get(r,"rope_parameters");
+        if(rp && rp->t == J_OBJ){
+            jval *rty = json_get(rp,"rope_type"); if(!rty) rty = json_get(rp,"type");
+            if(rty && rty->str && strcmp(rty->str,"default")){
+                fprintf(stderr,
+                    "config: rope_parameters.rope_type=\"%s\" found but no legacy "
+                    "rope_scaling block is present -- this engine cannot infer "
+                    "scaling from rope_parameters alone (unhandled rope config "
+                    "format)\n", rty->str);
+                exit(1);
+            }
+        }
+        return;                                        /* GLM: nothing more to do */
+    }
+    jval *ty = json_get(sc,"type"); if(!ty) ty = json_get(sc,"rope_type");
+    if(!ty || !ty->str || strcmp(ty->str,"yarn")){
+        /* Silently ignoring an unknown scaling would produce a fluent-but-wrong
+         * model. linear/dynamic/llama3 need their own math; refuse instead. */
+        fprintf(stderr,"config: rope_scaling type \"%s\" is not supported (only \"yarn\")\n",
+                (ty && ty->str) ? ty->str : "(missing)");
+        exit(1);
+    }
+    jval *jf = json_get(sc,"factor");
+    double factor = jf ? jf->num : 1.0;
+    if(!(factor > 0.0)){ fprintf(stderr,"config: rope_scaling.factor=%g must be > 0\n",factor); exit(1); }
+    jval *jo = json_get(sc,"original_max_position_embeddings");
+    double orig = jo ? jo->num : 4096.0;
+    if(!(orig > 1.0)){ fprintf(stderr,"config: original_max_position_embeddings=%g must be > 1\n",orig); exit(1); }
+    jval *jbf = json_get(sc,"beta_fast"),  *jbs = json_get(sc,"beta_slow");
+    jval *jms = json_get(sc,"mscale"),     *jma = json_get(sc,"mscale_all_dim");
+    double beta_fast = jbf ? jbf->num : 32.0, beta_slow = jbs ? jbs->num : 1.0;
+    double mscale    = jms ? jms->num : 1.0,  mscale_all = jma ? jma->num : 1.0;
+    /* K2.6-vs-K2-Thinking discriminator, see Cfg/mt_is_k26. Deliberately NOT beta_fast:
+     * the math above defaults a missing beta_fast to 32.0 (the reference default), but
+     * 32.0 is exactly the value that MEANS K2.6 to the discriminator. Storing the default
+     * would make a yarn config with no explicit beta_fast key render as K2.6 here while
+     * c/coli and c/openai_server.py -- which both test isinstance(beta_fast,(int,float))
+     * and so read absent as NOT-K2.6 -- render it as K2-Thinking. Same directory, two
+     * prompt formats, no error. Record absence as 1.0f so all three sites agree. */
+    c->rope_beta_fast = jbf ? (float)beta_fast : 1.0f;
+
+    double lo_d = yarn_correction_dim(beta_fast, dim, (double)c->theta, orig);
+    double hi_d = yarn_correction_dim(beta_slow, dim, (double)c->theta, orig);
+    double low = floor(lo_d), high = ceil(hi_d);
+    if(low < 0) low = 0;
+    if(high > dim - 1) high = dim - 1;
+    if(low == high) high += 0.001;                    /* reference guards the div */
+
+    for(int j=0;j<half;j++){
+        double extra = pow((double)c->theta, -2.0*j/(double)dim);
+        double inter = extra / factor;
+        double ramp  = (j - low) / (high - low);
+        if(ramp < 0) ramp = 0; else if(ramp > 1) ramp = 1;
+        double mask  = 1.0 - ramp;
+        g_inv_freq[j] = (float)(inter*(1.0-mask) + extra*mask);
+    }
+    g_yarn = 1;
+    g_yarn_mscale = (float)(yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all));
+
+    /* DeepseekV3Attention.__init__ applies a SECOND, separate YaRN correction to
+     * the softmax scale (self.scaling), independent of the rotary attention_scaling
+     * above: self.scaling *= get_mscale(factor, mscale_all_dim)**2. It uses
+     * mscale_all_dim ALONE (not the ratio) and only when mscale_all_dim is present
+     * and non-zero -- mirror that guard exactly (jma missing or 0 => no correction,
+     * matching the reference's `config.rope_parameters.get("mscale_all_dim", 0)` +
+     * `if mscale_all_dim:`). c->attn_scale must already hold 1/sqrt(qk_head) here
+     * (load_cfg sets it before calling rope_table_init) since this multiplies it,
+     * rather than replacing it. */
+    if(jma && jma->num != 0.0){
+        double corr = yarn_get_mscale(factor, jma->num);
+        c->attn_scale = (float)((double)c->attn_scale * corr * corr);
+    }
+}
+
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
     int half = c->qk_rope/2;
@@ -869,8 +1035,8 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
     if(!cache.valid||cache.pos!=pos||cache.qk!=c->qk_rope||cache.theta!=c->theta){
         for(int j=0;j<half;j++){
-            float inv=powf(c->theta,-2.0f*j/c->qk_rope),ang=pos*inv;
-            cache.cs[j]=cosf(ang); cache.sn[j]=sinf(ang);
+            float ang = pos*g_inv_freq[j];
+            cache.cs[j]=cosf(ang)*g_yarn_mscale; cache.sn[j]=sinf(ang)*g_yarn_mscale;
         }
         cache.pos=pos; cache.qk=c->qk_rope; cache.theta=c->theta; cache.valid=1;
     }
@@ -926,7 +1092,16 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
+    if(!th) th=json_get(r,"rope_theta");         /* flat key: Kimi-K2, MiniMax-M3 */
     c->theta = th?(float)th->num:10000.f;
+    { jval *mtv=json_get(r,"model_type");
+      if(mtv && mtv->str){ strncpy(c->model_type,mtv->str,sizeof(c->model_type)-1);
+                            c->model_type[sizeof(c->model_type)-1]=0; }
+      else c->model_type[0]=0; }
+    { jval *svv=json_get(r,"_colibri_source_variant");   /* see mt_is_k26 in sample.h */
+      if(svv && svv->str){ strncpy(c->source_variant,svv->str,sizeof(c->source_variant)-1);
+                            c->source_variant[sizeof(c->source_variant)-1]=0; }
+      else c->source_variant[0]=0; }
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
@@ -991,6 +1166,7 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
     #undef CKR
+    rope_table_init(c, r);                       /* needs c->theta and c->qk_rope */
     free(ar);
 }
 
@@ -1048,6 +1224,114 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
                 name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
     return fmt;
 }
+/* ---- streaming-expert scale sidecars -------------------------------------
+ * .qs may be F32 (GLM) or BF16/F16 (Kimi-K2 halves the container, and with it
+ * the per-expert streaming bandwidth). fslab ALWAYS holds F32 scales, so a
+ * narrow sidecar is read into the upper part of the same buffer and upcast
+ * forward in place:
+ *
+ *   [ 0 .............. NS*4 )      final F32 scales
+ *   [ NS*2+64 ... NS*2+64+NS*2 )   raw BF16 landing zone
+ *
+ * Forward walk is safe: writing out[i] ends at byte 4i+4, reading raw[i]
+ * starts at NS*2+64+2i; worst case i=NS-1 gives 4*NS <= 4*NS+62. The 64-byte
+ * pad is exactly what makes the final element safe.
+ *
+ * F32 sidecars take raw_off=0, no pad, and qscales_upcast returns immediately
+ * -- the GLM path is byte-identical to before. */
+#define QSCALES_PAD 64
+typedef struct {
+    int     sbytes;        /* 4 = F32, 2 = BF16/F16 */
+    int     dt;            /* raw dtype (0=BF16 1=F16 2=F32) -- selects the upcast
+                             * converter; sbytes alone can't (BF16 and F16 are both 2B) */
+    int64_t nsc[3];        /* scale COUNT per tensor (gate, up, down) */
+    int64_t NS;            /* total scale count */
+    int64_t raw_off;       /* byte offset of the raw landing zone (0 when sbytes==4) */
+} QScales;
+
+/* SEC: single choke point for the streaming path's .qs geometry. Refuses mixed
+ * dtypes across gate/up/down and any byte count that doesn't divide evenly --
+ * an untrusted container gets rejected here instead of resolving to a wrong
+ * group size downstream (that was the actual bug: qt_resolve_fmt silently
+ * matched gs=64 on Kimi-K2's bf16 .qs instead of the true gs=32).
+ *
+ * F16 (dtype 1) is DECODED, not refused: f16_to_f32 already exists (st.h) and the
+ * resident path (qt_from_disk -> st_read_f32) already decodes F16 sidecars fine,
+ * so the streaming path refusing it with exit(1) was a correctness asymmetry, not
+ * a safety improvement -- a resident model loads, then the process dies mid-
+ * generation the moment the first F16-scaled expert streams. Decoding correctly
+ * satisfies "never a silent mis-decode" strictly better than refusing does.
+ * A genuinely unrecognized dtype code still gets a hard refusal (return -1; the
+ * caller's own fatal/non-fatal contract decides whether that exits). */
+static int qscales_plan(shards *S, st_tensor *tq[3], QScales *q){
+    (void)S;
+    memset(q,0,sizeof *q);
+    int dt0 = tq[0]->dtype;                                   /* 0=BF16 1=F16 2=F32 */
+    if(dt0!=0 && dt0!=1 && dt0!=2) return -1;                 /* unrecognized dtype: refuse */
+    q->dt = dt0;
+    q->sbytes = (dt0==2) ? 4 : 2;
+    for(int k=0;k<3;k++){
+        if(tq[k]->dtype != dt0) return -1;                    /* mixed dtypes across the 3 tensors: refuse */
+        if(tq[k]->nbytes<=0 || (tq[k]->nbytes % q->sbytes)) return -1;
+        q->nsc[k] = tq[k]->nbytes / q->sbytes;
+        q->NS += q->nsc[k];
+    }
+    /* NS bound tight enough that qscales_alloc_bytes's NS*4+QSCALES_PAD cannot wrap
+     * size_t on LP64. Must subtract QSCALES_PAD before dividing, not after: since I1
+     * made the pad unconditional, NS==SIZE_MAX/4 would make qscales_alloc_bytes
+     * return (SIZE_MAX/4)*4+64 == 60 (wraps, doesn't guard) if the bound didn't
+     * reserve room for the pad. (SIZE_MAX-QSCALES_PAD)/4 is still an astronomically
+     * unreachable scale count for any real container -- this is a wrap guard, not a
+     * realistic ceiling. */
+    if(q->NS<=0 || q->NS > (int64_t)((SIZE_MAX-QSCALES_PAD)/4)) return -1;
+    q->raw_off = (q->sbytes==4) ? 0 : q->NS*2 + QSCALES_PAD;
+    return 0;
+}
+/* bytes fslab must hold: NS floats, plus a fixed QSCALES_PAD. The pad is
+ * unconditional (not just when sbytes!=4): required bytes must be a function of
+ * NS ALONE, because expert_load_impl's slot-reuse test ("ftot > s->fslab_cap")
+ * compares only NS. If required bytes also depended on sbytes, a slot last sized
+ * for an F32 expert (no pad needed) could be reused by a BF16 expert with an
+ * EQUAL NS -- same fslab_cap, so no realloc -- and overrun by QSCALES_PAD bytes.
+ * Latent today (containers are dtype-homogeneous) but the invariant must not
+ * depend on that. 64 bytes/slot is noise; GLM's read/upcast never touch the
+ * trailing pad, so this is still numerically byte-identical for F32. */
+static size_t qscales_alloc_bytes(const QScales *q){
+    return (size_t)q->NS*4 + QSCALES_PAD;
+}
+/* Landing address for tensor k's RAW sidecar bytes: for F32 this IS the final
+ * resting place (fslab + preceding scale counts); for BF16 it is inside the
+ * upper landing zone, laid out in the same tensor order. */
+static char *qscales_raw(float *fslab, const QScales *q, int k){
+    int64_t before=0; for(int i=0;i<k;i++) before += q->nsc[i];
+    if(q->sbytes==4) return (char*)(fslab + before);
+    return (char*)fslab + q->raw_off + before*2;
+}
+/* in place, no-op when sbytes==4 (GLM: byte-identical to before this change).
+ * Converter is picked by q->dt: BF16 (Kimi-K2) and F16 are both 2 bytes/scale
+ * but decode differently (bf16_to_f32 / f16_to_f32, both in st.h). */
+/* QS_BF16=1 keeps a bf16 .qs sidecar at its stored width in RAM instead of widening the
+ * whole array to f32 at load. The scales are ~20% of the bytes the fmt=4 expert kernel
+ * pulls from DRAM, and skipping the upcast ALSO leaves the f32 half of the fslab never
+ * written -- so those pages are never faulted in and the residency drops with the traffic.
+ * The allocation itself is deliberately unchanged (still NS*4+PAD), because
+ * expert_load_impl's slot-reuse test compares scale COUNT alone; making required bytes
+ * depend on sbytes would break that invariant for a benefit the untouched pages already
+ * give us.
+ *
+ * Restricted to dt==0 (BF16). F16 sidecars keep the upcast: f16_to_f32 is not a pure
+ * widening and the kernel would need a second converter for a case no container here
+ * uses. */
+static int g_qs_bf16 = 0;
+static inline int qscales_keep_raw(const QScales *q){
+    return g_qs_bf16 && q->sbytes==2 && q->dt==0;
+}
+static void qscales_upcast(float *fslab, const QScales *q){
+    if(q->sbytes==4) return;
+    const uint16_t *raw = (const uint16_t*)((char*)fslab + q->raw_off);
+    if(q->dt==1) for(int64_t i=0;i<q->NS;i++) fslab[i] = f16_to_f32(raw[i]);
+    else         for(int64_t i=0;i<q->NS;i++) fslab[i] = bf16_to_f32(raw[i]);
+}
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -1056,12 +1340,22 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
-        int64_t ns=st_nbytes(&m->S,sn);   /* scale bytes (F32) */
+        int64_t ns=st_nbytes(&m->S,sn);   /* scale bytes, in the sidecar's OWN dtype */
+        /* .qs may be stored BF16/F16 (2B/scale) instead of F32 (4B/scale) — e.g.
+         * Kimi-K2 ships bf16 group scales to halve the container. qt_resolve_fmt's
+         * count math (and its SEC bounds) is written in F32-equivalent bytes, so
+         * normalize here; st_read_f32_cap below already upcasts BF16/F16/F32 to
+         * float by dtype (see st_read_f32 in st.h), so only the byte-count fed to
+         * qt_resolve_fmt needs fixing. F32 sidecars get sbytes=4 -> ns4==ns, so the
+         * GLM path (f32 .qs) is byte-identical to before. */
+        int sdt = st_dtype(&m->S,sn);                 /* 0=BF16 1=F16 2=F32 */
+        int sbytes = (sdt == 2) ? 4 : 2;               /* F32=4B, BF16/F16=2B per scale */
+        int64_t ns4 = ns * 4 / sbytes;                 /* normalized to F32-equivalent bytes */
         /* fmt=4 int4-grouped: byte int4 ma scala > O*4 — gs deriva dalla scala.
          * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
          * non fidati (SEC). */
         int gs=0;
-        int fmt = qt_resolve_fmt(name,O,I,nb,ns,&gs);
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns4,&gs);
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
@@ -1524,16 +1818,24 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     if(rep && st_fd_rep(&m->S,tw[0]->fd,1)<0) rep=0;   /* shard not in the mirror (partial) */
     if(g_mmap){
         void *bw[3],*bq[3]; int okm=1;
+        QScales mqs;
+        if(qscales_plan(&m->S,tq,&mqs)) okm=0;
         for(int k=0;k<3;k++){
             bw[k]=map_of_fd(rep_bfd(&m->S,tw[k]->fd,rep)); bq[k]=map_of_fd(rep_bfd(&m->S,tq[k]->fd,rep));
             if(!bw[k]||!bq[k]||((tw[k]->off)&3)||((tq[k]->off)&3)) okm=0;
         }
+        if(okm && mqs.sbytes != 4) okm=0;   /* BF16 scales cannot be aliased as float*:
+                                             * fall through to the pread path below, which
+                                             * upcasts into fslab. Weights are still
+                                             * page-cache-warm from the mapping, so this
+                                             * costs a copy, not I/O (measure before
+                                             * optimizing further). */
         if(okm){
             QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
-                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,mqs.nsc[k]*4,&gs);   /* F32-equivalent */
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -1567,10 +1869,20 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         }
     }
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
-    int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
+    QScales qs;
+    if(qscales_plan(&m->S,tq,&qs)){ fprintf(stderr,"bad .qs sidecar dtype/size for layer %d expert %d\n",layer,eid);
+        if(fatal) exit(1); return -1; }
+    int64_t ftot=qs.NS;                    /* fslab is sized in SCALES, always f32 in memory */
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
      * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
     if(!s->slab || wtot+8192 > s->slab_cap){
+        if(s->aslab){   /* arena slice (#419): must NEVER be free()d -- an oversized
+                         * expert that no longer fits its layer's uniform arena slot
+                         * detaches and falls through to an individual allocation for
+                         * this one slot; the arena itself is never freed here (it
+                         * lives for the process lifetime, like every pinned expert). */
+            s->slab=NULL; s->aslab=NULL; s->slab_cap=0;
+        }
 #ifdef COLI_METAL
         /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
         if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
@@ -1587,40 +1899,67 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
 #endif
     }
     if(!s->fslab || ftot > s->fslab_cap){
+        if(s->afslab){  /* arena slice (#419): must NEVER be free()d. Losing fslab_cap's
+                         * page-rounded slack (it is now exactly NS, per the constraint
+                         * that required bytes are a pure function of the scale count)
+                         * makes this branch reachable for an oversized expert where the
+                         * old, generously-rounded cap silently absorbed it -- detach and
+                         * fall through to an individual allocation instead of freeing an
+                         * interior pointer into the shared per-layer arena (glibc
+                         * "free(): invalid pointer", or worse, silent heap corruption). */
+            s->fslab=NULL; s->afslab=NULL; s->fslab_cap=0;
+        }
 #ifdef COLI_METAL
         /* page-align + register: the GPU reads the scales in place (unified memory).
          * Honours `fatal` exactly like the CPU arm below — a speculative pilot load
          * that hits OOM must unwind into a clean hidden slot, never exit(). */
         if(s->fslab && g_metal_enabled) coli_metal_unregister(s->fslab);
         free(s->fslab);
-        size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
-        if(ftot<0 || (uint64_t)ftot > SIZE_MAX/sizeof(float) ||
-           posix_memalign((void**)&s->fslab,16384,fb)){
+        size_t fb=(qscales_alloc_bytes(&qs)+16383)&~(size_t)16383;
+        if(posix_memalign((void**)&s->fslab,16384,fb)){
             fprintf(stderr,"OOM fslab\n"); if(fatal) exit(1);
             /* unregister BEFORE freeing -- a stale g_slabs entry would let resolve() hand
              * the GPU a pointer into freed memory (and under COLI_METAL_RESSET=1, leave the
              * buffer a permanent residency-set member over it). Ported from e4/metal-heap
-             * validator fix 6753225; pre-existing gap on main/dev. */
+             * validator fix 6753225; pre-existing gap on main/dev.
+             * s->aslab guard: this fslab OOM does NOT mean slab itself failed or is
+             * unwanted -- but tearing the whole slot down to a clean, hidden state on
+             * ANY failure is the existing contract here, and slab may STILL be this
+             * slot's (untouched) arena slice if the slab block above didn't need to
+             * grow it. Never free an interior arena pointer -- detach instead (see the
+             * ESlot struct's aslab/afslab independence comment). */
             if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
-            compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0;  /* clean, hidden slot (eid stays -1) */
+            if(!s->aslab) compat_aligned_free(s->slab);  /* arena slice: detach only, never free */
+            s->slab=NULL; s->aslab=NULL; s->slab_cap=0;  /* clean, hidden slot (eid stays -1) */
             s->fslab=NULL; s->fslab_cap=0; return -1;
         }
         s->fslab_cap=ftot;
         if(g_metal_enabled) coli_metal_register(s->fslab,fb);
 #else
         free(s->fslab);
-        if(fatal){ s->fslab=falloc(ftot); }          /* main path: byte-identical exit-on-OOM */
+        /* qscales_alloc_bytes(&qs), NOT ftot*sizeof(float): ftot is now a SCALE COUNT
+         * (qs.NS), and a BF16 sidecar needs NS*4 bytes for the upcast F32 result PLUS
+         * the 64-byte-padded NS*2-byte raw landing zone (see QScales's header comment).
+         * falloc(ftot) would allocate only ftot floats with no pad -- exactly the
+         * fatal-path variant of the bug this task fixes -- so use the byte-count
+         * checked allocator (xalloc) instead, which keeps falloc's exit-on-OOM. */
+        if(fatal){ s->fslab=(float*)xalloc(qscales_alloc_bytes(&qs),"expert fslab"); }
         else {                                        /* speculative pilot: checked alloc, never exit() */
-            /* replicate falloc's anti-wrap guard + malloc (no zeroing/alignment) */
-            if(ftot<0 || (uint64_t)ftot > SIZE_MAX/sizeof(float) ||
-               !(s->fslab=malloc((size_t)ftot*sizeof(float)))){
+            if(!(s->fslab=malloc(qscales_alloc_bytes(&qs)))){
                 fprintf(stderr,"OOM fslab\n");
-                compat_aligned_free(s->slab); s->slab=NULL; s->slab_cap=0; /* leave a clean, hidden slot (eid stays -1) */
+                /* slab may STILL be this slot's untouched arena slice (the slab block
+                 * above didn't necessarily need to grow it) -- never free an interior
+                 * arena pointer, detach instead (see the ESlot struct's aslab/afslab
+                 * independence comment). Newly reachable since the earlier fix guarded
+                 * this block's initial free(s->fslab): before that, an arena fslab
+                 * would already have aborted on that free, never reaching here. */
+                if(!s->aslab) compat_aligned_free(s->slab);
+                s->slab=NULL; s->aslab=NULL; s->slab_cap=0; /* leave a clean, hidden slot (eid stays -1) */
                 s->fslab=NULL; s->fslab_cap=0; return -1;
             }
         }
         s->fslab_cap=ftot;
-        numa_slab_bind(s->fslab,(size_t)ftot*sizeof(float));
+        numa_slab_bind(s->fslab,qscales_alloc_bytes(&qs));
 #endif
     }
     /* DISK-CLASS: classify before the reads; computed unconditionally at dc_on sites so
@@ -1670,14 +2009,22 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(mir_pread(&m->S, tq[k]->fd, rep, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1);
+        if(mir_pread(&m->S, tq[k]->fd, rep, qscales_raw(s->fslab,&qs,k), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1);
             if(dc_on) dc_wall_exit(dc_cls,now_s());       /* pair the enter on the non-fatal unwind */
             return -1; }
-        fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
-    atomic_fetch_add_explicit(&g_prof_io,wtot+fo*4,memory_order_relaxed);
+        fp[k]=s->fslab+fo; fo+=qs.nsc[k]; }
+    if(qscales_keep_raw(&qs))                    /* QS_BF16: scales stay where they landed */
+        for(int k=0;k<3;k++) fp[k]=(float*)qscales_raw(s->fslab,&qs,k);
+    else qscales_upcast(s->fslab,&qs);           /* BF16 -> F32 in place; no-op for F32 sidecars */
+    int64_t qs_bytes_read = qs.NS*(int64_t)qs.sbytes;   /* bytes ACTUALLY read (not fo*4: fo counts
+                                                          * scales, and a BF16 sidecar reads half the
+                                                          * bytes of its F32-equivalent scale count --
+                                                          * fo*4 would silently double the reported
+                                                          * streaming bandwidth for a BF16 container */
+    atomic_fetch_add_explicit(&g_prof_io,wtot+qs_bytes_read,memory_order_relaxed);
     if(dc_on){                                    /* DISK-CLASS accounting, see dc_needed() */
         double dc_t1=now_s();                     /* one clock read for thread-ns AND the wall exit */
-        int64_t bytes=wtot+fo*4;
+        int64_t bytes=wtot+qs_bytes_read;
         atomic_fetch_add_explicit(&g_dc_n[dc_cls],1,memory_order_relaxed);
         atomic_fetch_add_explicit(&g_dc_bytes[dc_cls],bytes,memory_order_relaxed);
         atomic_fetch_add_explicit(&g_dc_ns[dc_cls],(int64_t)((dc_t1-dc_t0)*1e9),memory_order_relaxed);
@@ -1695,9 +2042,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs);
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,qs.nsc[k]*4,&gs);   /* F32-equivalent */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+        qt[k]->s_bf16=qscales_keep_raw(&qs);
     }
     s->eid=eid; return 0;
 }
@@ -1728,6 +2076,7 @@ typedef struct {
 typedef struct {
     Model *m; ESlot *s; int layer,eid,fatal;
     st_tensor *tw[3],*tq[3]; int64_t pos[3];
+    QScales qs;
     int pending,done,finalized,error;
 } UringLoad;
 typedef struct {
@@ -1783,7 +2132,8 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         if(!l->tw[k]||!l->tq[k]) return uring_load_error(l,ENOENT,"io_uring expert metadata"),li;
     }
     int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
-    int64_t ftot=(l->tq[0]->nbytes+l->tq[1]->nbytes+l->tq[2]->nbytes)/4;
+    if(qscales_plan(&l->m->S,l->tq,&l->qs)) return uring_load_error(l,EINVAL,"io_uring expert .qs dtype"),li;
+    int64_t ftot=l->qs.NS;
     if(wtot<=0 || ftot<=0) return uring_load_error(l,EINVAL,"io_uring expert size"),li;
     if(!s->slab || wtot+8192>s->slab_cap){
 #ifdef COLI_METAL
@@ -1803,12 +2153,12 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     if(!s->fslab || ftot>s->fslab_cap){
 #ifdef COLI_METAL
         if(s->fslab&&g_metal_enabled) coli_metal_unregister(s->fslab);
-        free(s->fslab); size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
+        free(s->fslab); size_t fb=(qscales_alloc_bytes(&l->qs)+16383)&~(size_t)16383;
         if(posix_memalign((void**)&s->fslab,16384,fb)){
             s->fslab=NULL; s->fslab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert scales"),li; }
         s->fslab_cap=ftot; if(g_metal_enabled) coli_metal_register(s->fslab,fb);
 #else
-        free(s->fslab); s->fslab=malloc((size_t)ftot*sizeof(float));
+        free(s->fslab); s->fslab=malloc(qscales_alloc_bytes(&l->qs));
         if(!s->fslab){ s->fslab_cap=0; return uring_load_error(l,ENOMEM,"io_uring expert scales"),li; }
         s->fslab_cap=ftot;
 #endif
@@ -1841,11 +2191,9 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
             o+=l->tw[k]->nbytes;
         }
     }
-    int64_t fo=0;
     for(int k=0;k<3;k++){
-        if(uring_add_read(b,li,l->tq[k]->fd,s->fslab+fo,(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
+        if(uring_add_read(b,li,l->tq[k]->fd,qscales_raw(s->fslab,&l->qs,k),(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
             return uring_load_error(l,errno,"io_uring expert scale read"),li;
-        fo+=l->tq[k]->nbytes/4;
     }
     return li;
 }
@@ -1883,15 +2231,18 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     }
     Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden; float *fp[3]; int64_t fo=0;
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
+    int keep_raw=qscales_keep_raw(&l->qs);   /* QS_BF16: publish the bf16 scales as-is */
+    if(!keep_raw) qscales_upcast(s->fslab,&l->qs);  /* reads complete; BF16 -> F32 before publishing */
     for(int k=0;k<3;k++){
-        fp[k]=s->fslab+fo; fo+=l->tq[k]->nbytes/4;
+        fp[k]=keep_raw?(float*)qscales_raw(s->fslab,&l->qs,k):s->fslab+fo; fo+=l->qs.nsc[k];
         int64_t nb=l->tw[k]->nbytes;
         /* qt_resolve_fmt like the other two expert paths: the raw ?1:?2:3 inference here
          * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2. */
         int gs=0;
-        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->tq[k]->nbytes,&gs);
+        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->qs.nsc[k]*4,&gs);   /* F32-equivalent */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
+        qt[k]->s_bf16=keep_raw;
     }
     if(publish_eid) s->eid=l->eid;
     l->finalized=1; return 0;
@@ -2069,16 +2420,34 @@ static void expert_host_release(Model *m, ESlot *s){
      * free() corrupts the CRT heap (0xC0000374) — same bug the compat.h audit
      * fixed at the original expert_load site. fslab is plain malloc/falloc
      * on the CPU path, so its free() stays plain (Metal path frees it before
-     * re-alloc and never reaches here with an aligned fslab on _WIN32). */
-    if(s->aslab){ s->slab=NULL; s->fslab=NULL; }  /* arena slice (#419): detach, keep caps, never free */
-    else { compat_aligned_free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0; }
+     * re-alloc and never reaches here with an aligned fslab on _WIN32).
+     *
+     * INVARIANT: aslab and afslab are tracked INDEPENDENTLY, never as one combined
+     * flag. expert_load_impl's slab and fslab realloc guards are two separate
+     * blocks (an oversized expert can outgrow only its weight slice, or only its
+     * scale slice) -- either can detach its OWN buffer from the arena (aslab=NULL
+     * or afslab=NULL) while the other stays arena-owned. Testing `aslab` alone and
+     * then touching BOTH pointers (the previous, combined-flag version of this
+     * function) frees an interior arena pointer whenever exactly one of the two
+     * has been detached -- so slab and fslab must each be tested against their
+     * OWN arena marker here. */
+    if(s->aslab)  s->slab=NULL;                          else { compat_aligned_free(s->slab); s->slab=NULL;  s->slab_cap=0; }
+    if(s->afslab) s->fslab=NULL;                         else { free(s->fslab);              s->fslab=NULL; s->fslab_cap=0; }
     QT *q[3]={&s->g,&s->u,&s->d};
     for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
     m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
 }
 static void expert_host_ensure(Model *m, int layer, ESlot *s){
     if(s->slab) return;
-    if(s->aslab){ s->slab=s->aslab; s->fslab=s->afslab; }  /* re-attach the arena slice; caps survived release */
+    /* Re-attach each buffer from its OWN arena marker independently (see the
+     * INVARIANT comment in expert_host_release) -- caps survived release for
+     * whichever of the two is still arena-owned. Whichever one is NOT (aslab/
+     * afslab NULL, because it was individually allocated and release freed it,
+     * or because a prior expert_load_impl call detached it from the arena)
+     * stays NULL here; expert_load below allocates it fresh via expert_load_impl's
+     * own "!s->slab" / "!s->fslab" checks. */
+    if(s->aslab)  s->slab=s->aslab;
+    if(s->afslab) s->fslab=s->afslab;
     /* re-materializing a GPU-resident expert's host copy, not a routing miss: demand=0 */
     expert_load(m,layer,s->eid,s,1,0);                     /* rebuild the QT views (release NULLed them) + reload */
 }
@@ -2280,6 +2649,15 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     size_t xb=(size_t)S*D*4, qrb=(size_t)S*ql*4, qb=(size_t)S*H*qh*4;
     size_t cb=(size_t)S*(kvl+R)*4, lb=(size_t)T*kvl*4, rb=(size_t)T*R*4;
     float *chost=NULL; int ok=0;
+    /* YaRN rescales individual rotary frequencies; the device pipe-rope kernel
+     * only takes a scalar theta and would compute a DIFFERENT rope than the CPU
+     * path. Fall back to the CPU attention path rather than be silently wrong.
+     * Extending the kernel is tracked in the Stage 2 spec (deferred). */
+    if(g_yarn){
+        static _Thread_local int warned=0;
+        if(!warned){ warned=1; fprintf(stderr,"[rope] YaRN active: device pipe-rope disabled, using the CPU path\n"); }
+        goto done;
+    }
     /* scratch persistenti (slot fissi per device): zero churn di cudaMalloc */
     float *xd =x_is_dev?(float*)x:coli_cuda_pipe_scratch(dev,0,xb);
     float *qrd=coli_cuda_pipe_scratch(dev,1,qrb);
@@ -2387,9 +2765,14 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * would rope every row at position 0 and attend over a 1-token window of the wrong
      * cache -> greedy decode hits EOS at token 2 (mux answers truncated to 1 token).
      * Ragged rows take the CPU absorb path below, which reads kvs[s]/positions[s]. */
+    /* !g_yarn: coli_metal_attn_decode ropes on-device from a scalar theta, same
+     * limitation as the CUDA pipe-rope path (see attn_pipe_prefill) -- it cannot
+     * express a YaRN table. Currently unreachable for K2 anyway (its dims don't
+     * match the GLM-5.2 checks below), but that's incidental; guard explicitly so
+     * this stays safe if those dimension checks are ever generalised. */
     if(g_metal_enabled && !kvs && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
-       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
+       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2 && !g_yarn){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){   /* index keys for future selection */
@@ -2812,11 +3195,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
                          * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
                          * per tutto il resolve/matmul/promozione qui sotto). */
+        double tpw0=g_prof?now_s():0;
         pthread_mutex_lock(&g_pilot_mx);
         atomic_store_explicit(&g_cur_moe_layer,layer,memory_order_release);
         while(layer>=0 && layer<256 && g_pilot_inflight[layer]>0)
             pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
         pthread_mutex_unlock(&g_pilot_mx);
+        if(g_prof) m->t_pilotw += now_s()-tpw0;
     }
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     /* DISK-CLASS: does THIS call need the pre-bump recency snapshot? Must agree with
@@ -4225,11 +4610,18 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * Fallback: qualsiasi condizione mancante -> percorso CPU intero qui sotto.
      * !kvs: ragged mux rows (per-row KV/position) are not expressible in this kernel's
      * single Lc/Rc + pos_base contract — see the matching guard in attention_rows. */
+    /* !g_yarn: coli_metal_layer_decode ropes on-device from a scalar theta (see
+     * backend_metal.h), same limitation as the CUDA pipe-rope path (attn_pipe_prefill)
+     * and the Metal fast-decode attention path (attention_rows) -- it cannot express a
+     * YaRN frequency table. Currently unreachable for K2 anyway (its dims don't match
+     * the GLM-5.2 checks below), but that's incidental; guard explicitly so this stays
+     * safe if those dimension checks are ever generalised. */
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
        && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
-       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048){
+       && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048
+       && !g_yarn){
         int sel_active = m->has_dsa && c->idx_type[li] && (pos_base+S) > c->index_topk;
         if(!sel_active){
             static float *linrm,*lnrm,*lsh,*lw; static int *lidx,*lkeff;
@@ -4477,8 +4869,13 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
+    double th0=now_s();                     /* step()/step_decode_batch() bracket this too;
+                                             * without it the decode loop (which calls
+                                             * step_all) reported lm_head as 0.000s and the
+                                             * cost landed in PROFILE's `other` residual. */
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
+    m->t_head += now_s()-th0;
     free(x); free(row); return lo;
 }
 
@@ -4943,17 +5340,18 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head;
+    double accounted=m->t_ewait+m->t_emm+m->t_attn+m->t_head+m->t_pilotw;
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(including kvb %.3fs) | lm_head %.3fs | other %.3fs\n",
         edisk_s(),m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
     printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
         m->t_aproj,m->t_acore,m->t_aout);
-    if(g_prof)printf("P0-EXEC: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | router %.3fs | residual P2P %.3fs / %llu hop | orchestration %.3fs\n",
+    if(g_prof)printf("P0-EXEC: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | router %.3fs | residual P2P %.3fs / %llu hop | pilot-wait %.3fs | orchestration %.3fs\n",
         m->t_ecpu,m->t_ecpu>0?m->cpu_expert_bytes/1e9/m->t_ecpu:0.0,
         (unsigned long long)m->cpu_expert_rows,m->t_egpu,m->t_route,m->t_p2p,(unsigned long long)m->n_p2p,
-        elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p>0?
-        elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p:0);
+        m->t_pilotw,
+        elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p-m->t_pilotw>0?
+        elapsed-m->t_ewait-m->t_emm-m->t_attn-m->t_head-m->t_route-m->t_p2p-m->t_pilotw:0);
     if(g_mirror){
         double b0=atomic_load_explicit(&g_mir_bytes[0],memory_order_relaxed)/1e9;
         double b1=atomic_load_explicit(&g_mir_bytes[1],memory_order_relaxed)/1e9;
@@ -5066,16 +5464,17 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     int64_t cpu_bytes=m->cpu_expert_bytes-b->cpu_bytes;
     uint64_t cpu_rows=m->cpu_expert_rows-b->cpu_rows;
     double attn=m->t_attn-b->attn, head=m->t_head-b->head;
-    double other=elapsed-io_w-emm-attn-head-route-p2p; if(other<0) other=0;
+    double pilotw=m->t_pilotw-b->pilotw;
+    double other=elapsed-io_w-emm-attn-head-route-p2p-pilotw; if(other<0) other=0;
     double f_io=io_w/elapsed, f_emm=emm/elapsed, f_attn=attn/elapsed;
-    fprintf(f,"[PROF] time shares: expert-I/O %.0f%% | expert-matmul %.0f%% | attention %.0f%% | lm_head %.0f%% | other %.0f%%\n",
-        100*f_io,100*f_emm,100*f_attn,100*head/elapsed,100*other/elapsed);
+    fprintf(f,"[PROF] time shares: expert-I/O %.0f%% | expert-matmul %.0f%% | attention %.0f%% | lm_head %.0f%% | pilot-wait %.0f%% | other %.0f%%\n",
+        100*f_io,100*f_emm,100*f_attn,100*head/elapsed,100*pilotw/elapsed,100*other/elapsed);
     double slow=ecpu>egpu?ecpu:egpu,fast=ecpu<egpu?ecpu:egpu;
     fprintf(f,"[PROF] P0 execution: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | tier straggler %.2fx | "
-              "router %.3fs | residual P2P %.3fs (%llu hop, %.3f ms/hop) | orchestration %.3fs\n",
+              "router %.3fs | residual P2P %.3fs (%llu hop, %.3f ms/hop) | pilot-wait %.3fs | orchestration %.3fs\n",
         ecpu,ecpu>0?cpu_bytes/1e9/ecpu:0.0,(unsigned long long)cpu_rows,
         egpu,fast>1e-9?slow/fast:0.0,route,p2p,(unsigned long long)np2p,
-        np2p?p2p*1e3/np2p:0.0,other);
+        np2p?p2p*1e3/np2p:0.0,pilotw,other);
     if(f_io>=0.30){
         fprintf(f,"[PROF] verdict: I/O-bound — %.0f%% of the time waits on expert reads (hit %.0f%%).",100*f_io,hitp);
         if(hitp<90) fprintf(f," More cache is the lever: raise RAM_GB (or add RAM).");
@@ -5856,6 +6255,46 @@ static void run_serve_mux(Model *m, const char *snap){
     m->kv=NULL; m->Lc=m->Rc=m->Ic=NULL; m->kv_start=NULL; m->max_t=0;
 }
 
+/* Build the templated bytes for one interactive turn (run_serve's line protocol only --
+ * the API/mux path hands over already-templated bytes, see mux_submit). `first` gates the
+ * once-per-conversation prefix: GLM's [gMASK]<sop> and K2-Thinking's default system preamble
+ * both only belong at the start of a session, exactly like the reference chat_template.jinja
+ * (K2-Thinking's preamble is emitted only when the message list doesn't already open with a
+ * system turn -- here that is equivalent to "this is turn 1").
+ *
+ * K2-Thinking (is_k2 && !is_k26) gets NO think marker at all: unlike GLM's
+ * <think></think>-means-nothink convention, K2-Thinking decides on its own, per generation,
+ * whether to open <think> -- there is no template-level lever for it, so `tk` is not used
+ * on that path.
+ *
+ * K2.6 (is_k2 && is_k26) is a DIFFERENT real chat_template.jinja (pinned from the
+ * checkpoint's own file, rendered through transformers' Jinja2 env):
+ * it never emits a default system preamble (`first` is irrelevant on this path -- the
+ * real template has no such block at all, not even a first-turn-only one), and it
+ * ALWAYS emits a think marker after the assistant turn -- <think> or <think></think>,
+ * exactly GLM's THINK-env convention, reusing `tk` unchanged. */
+static int build_turn_prompt(char *buf, int bufsz, int is_k2, int is_k26, int templ, int first,
+                              const char *input, const char *tk){
+    if(!templ) return snprintf(buf,bufsz,"%s",input);
+    int bl=0;
+    if(is_k2){
+        if(is_k26){
+            bl+=snprintf(buf+bl,bufsz-bl,
+                "<|im_user|>user<|im_middle|>%s<|im_end|><|im_assistant|>assistant<|im_middle|>%s",
+                input,tk);
+            return bl;
+        }
+        if(first) bl+=snprintf(buf+bl,bufsz-bl,
+            "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>");
+        bl+=snprintf(buf+bl,bufsz-bl,
+            "<|im_user|>user<|im_middle|>%s<|im_end|><|im_assistant|>assistant<|im_middle|>",input);
+        return bl;
+    }
+    if(first) bl+=snprintf(buf+bl,bufsz-bl,"[gMASK]<sop>");
+    bl+=snprintf(buf+bl,bufsz-bl,"<|user|>%s<|assistant|>%s",input,tk);
+    return bl;
+}
+
 static void run_serve(Model *m, const char *snap){
     /* Serve mode speaks a byte protocol over BOTH stdout and stdin:
      *   stdout: \x01\x01READY\x01\x01\n, STAT lines, \x01\x01END\x01\x01\n
@@ -5951,8 +6390,12 @@ static void run_serve(Model *m, const char *snap){
         int bl=0, k=0;                           /* costruisce/tokenizza il turno */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
          * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
-         * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita. */
+         * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita.
+         * (K2-Thinking non ha questa leva: build_turn_prompt ignora tk sul path K2-Thinking, vedi
+         * sopra. K2.6 SI' -- stessa convenzione THINK, vedi build_turn_prompt.) */
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
+        int is_k2 = mt_is_k2(&m->c);
+        int is_k26 = mt_is_k26(&m->c);
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
@@ -5969,13 +6412,10 @@ static void run_serve(Model *m, const char *snap){
                 active,len,prompt_tokens,k);
             free(tmp);
         } else {
-            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
-                       bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
-            else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
+            bl=build_turn_prompt(buf,1<<16,is_k2,is_k26,templ,first,input,tk);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
             if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
-                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
-                else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
+                bl=build_turn_prompt(buf,1<<16,is_k2,is_k26,templ,1,input,tk);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
                 prompt_tokens=k;
             }
@@ -6081,13 +6521,28 @@ static int mem_wire(void *addr, size_t len){
  * slots keep live-looking q8/q4 forever -- that was the bug that wired 363 GB
  * instead of 231 GB and starved the kernel into page-cache thrashing.
  * wired/failed are accumulated into the caller's counters. */
+/* scale COUNT for a resident QT, mirroring the fmt ladder qt_from_disk already uses
+ * for its st_read_f32_cap call (i3_groups is in scope here; quant.h is included
+ * above qt_bytes's own definition, so qt_bytes keeps its literal ((I+63)/64) instead
+ * of calling this). fmt=4/5 need the GROUP count, not a bare O -- using O alone
+ * under-counts every grouped-int4/int3-g64 scale block, which in turn OVER-counts
+ * weight_b (qt_bytes(t)-scale_b) by the same amount. Against an mmap'd file region
+ * a few extra wired bytes are harmless; against a tightly-sized malloc'd s->slab
+ * (the BF16 mmap->pread fallthrough this task added) the same over-count can walk
+ * mem_wire() past the actual allocation. */
+static int64_t qt_scale_count(const QT *t){
+    if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng; }
+    if(t->fmt==5) return (int64_t)t->O*i3_groups(t->I);
+    if(t->fmt==6) return 1;
+    return (int64_t)t->O;
+}
 /* undo qt_wire_mmap for one QT: used when a REPIN gpu_swap promotes a wired
  * RAM-tier expert into VRAM -- without this every promotion leaks its locked
  * host range and the dead-weight lock re-grows over a long session. */
 static void qt_unwire_mmap(QT *t){
     if(!g_mmap || !mem_should_wire()) return;
     if(!t->q8 && !t->q4) return;
-    int64_t scale_b=(int64_t)t->O*4;
+    int64_t scale_b=qt_scale_count(t)*4;
     int64_t weight_b=qt_bytes(t)-scale_b;
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
@@ -6101,7 +6556,7 @@ static void qt_unwire_mmap(QT *t){
 static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
     if(!t->q8 && !t->q4) return;
     if(t->cuda_eligible) return;   /* resident in VRAM; host range is dead weight */
-    int64_t scale_b=(int64_t)t->O*4;
+    int64_t scale_b=qt_scale_count(t)*4;
     int64_t weight_b=qt_bytes(t)-scale_b;
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
     if(weight_b>0){ if(mem_wire(wp,(size_t)weight_b)==0) *wired+=weight_b; else (*failed)++; }
@@ -6229,17 +6684,22 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
     const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int l=0;l<NR;l++){
         if(cnt[l]<2) continue;
-        int64_t wtot=0, qtot=0; int ok=1;
+        int64_t wtot=0; int ok=1; st_tensor *tqs[3]={NULL,NULL,NULL};
         for(int k=0;k<3 && ok;k++){
             char nm[288],qn[320];
             snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.%s.weight",l,r[first[l]].e,suf[k]);
             snprintf(qn,sizeof qn,"%s.qs",nm);
-            st_tensor *tw=st_find(&m->S,nm), *tq=st_find(&m->S,qn);
-            if(!tw||!tq) ok=0; else { wtot+=tw->nbytes; qtot+=tq->nbytes; }
+            st_tensor *tw=st_find(&m->S,nm); tqs[k]=st_find(&m->S,qn);
+            if(!tw||!tqs[k]) ok=0; else wtot+=tw->nbytes;
         }
         if(!ok) continue;                     /* unquantized fallback: individual allocs */
+        QScales aqs;
+        if(qscales_plan(&m->S,tqs,&aqs)) continue;   /* odd sidecar: individual allocs */
         size_t ws=((size_t)wtot+8192+4095)&~(size_t)4095;
-        size_t fs=((size_t)(qtot/4)*sizeof(float)+4095)&~(size_t)4095;
+        /* qscales_alloc_bytes, NOT qtot/4*4: a BF16 sidecar has HALF the bytes of the
+         * F32 scales it decodes to, so the old expression under-allocated every slice
+         * by 2x and each expert's upcast ran into its neighbour's scales. */
+        size_t fs=(qscales_alloc_bytes(&aqs)+4095)&~(size_t)4095;
         uint8_t *aw=NULL; float *af=NULL;
         if(posix_memalign((void**)&aw,4096,(size_t)cnt[l]*ws)) continue;
         if(posix_memalign((void**)&af,4096,(size_t)cnt[l]*fs)){ free(aw); continue; }
@@ -6251,7 +6711,7 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
             ESlot *s=&m->pin[l][slot_of[a]];
             s->slab=aw+(size_t)i*ws;   s->slab_cap=(int64_t)ws;   s->aslab=s->slab;
             s->fslab=(float*)((uint8_t*)af+(size_t)i*fs);
-            s->fslab_cap=(int64_t)(fs/sizeof(float));             s->afslab=s->fslab;
+            s->fslab_cap=(int64_t)aqs.NS;                         s->afslab=s->fslab;
             i++;
         }
     }
@@ -6789,6 +7249,14 @@ int main(int argc, char **argv){
     if(!g_mirror_dir||!*g_mirror_dir) g_mirror_dir = getenv("SNAP_MIRROR");
     if(g_mirror_dir&&!*g_mirror_dir) g_mirror_dir = NULL;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    /* Default ON: keeping bf16 .qs scales bf16 in RAM halves their resident cost, so a
+     * K2-family container holds more of itself in the page cache; output is bit-identical
+     * either way. Cannot reach GLM (f32 sidecars fail qscales_keep_raw's sbytes==2 test).
+     * The win is bandwidth-bound and therefore machine-dependent -- QS_BF16=0 restores the
+     * widen-at-load path so it can be A/B'd on the target host. */
+    g_qs_bf16 = getenv("QS_BF16")?atoi(getenv("QS_BF16")):1;
+    fprintf(stderr,"[QS] bf16 expert scales: %s\n",
+            g_qs_bf16 ? "kept in RAM (default)" : "widened to f32 at load (QS_BF16=0)");
     g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
@@ -6922,9 +7390,13 @@ int main(int argc, char **argv){
     int mux_will_disable_mtp = getenv("SERVE") && getenv("SERVE_BATCH") &&
                                atoi(getenv("SERVE_BATCH")) && mux_slots>1;
     int eff_draft = mux_will_disable_mtp ? 0 : g_draft;
-    printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
+    /* model_type goes at the END of the line: c/coli's status display greps this exact line
+     * with `loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB` (coli:741) -- anything
+     * inserted BETWEEN those two literals would silently break that match. Appending is safe. */
+    printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d) | model=%s\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
-           m.has_mtp?(mux_will_disable_mtp?"DISABLED (multiplexed serve)":"ACTIVE"):"absent", eff_draft);
+           m.has_mtp?(mux_will_disable_mtp?"DISABLED (multiplexed serve)":"ACTIVE"):"absent", eff_draft,
+           m.c.model_type[0]?m.c.model_type:"(unset)");
     /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
     if(mux_will_disable_mtp && m.has_mtp)
         fprintf(stderr,"[MTP] disabled in multiplexed serve (SERVE_BATCH=1, KV_SLOTS>1): speculation is "
