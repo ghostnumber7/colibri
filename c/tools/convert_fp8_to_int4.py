@@ -28,6 +28,28 @@ USO:
 import os, sys, glob, json, shutil, argparse
 import numpy as np
 
+def read_n_layers_from_config(cfg_dir):
+    """Read num_hidden_layers from <cfg_dir>/config.json, if present and readable.
+    Inspection-driven replacement for the old arch-keyed detect_arch: n_layers is
+    read from the checkpoint's OWN config regardless of which architecture it is
+    (GLM, Kimi K2, or anything else DeepSeek-V3-shaped) -- no arch name involved.
+    Kimi-K2.6 nests the real params under `text_config` (see flatten_container_config);
+    check there too when the flat key is absent, so a K2.6 --indir/--repo source
+    resolves the real layer count instead of silently keeping --n-layers' default.
+    Returns None (caller keeps whatever --n-layers default/override it already has)
+    on any read failure or a missing key -- never raises, since a malformed/partial
+    config.json (e.g. a mid-download mirror) must not crash the whole conversion."""
+    try:
+        cfg = json.loads(open(os.path.join(cfg_dir, "config.json")).read())
+    except (OSError, ValueError):
+        return None
+    if "num_hidden_layers" in cfg:
+        return cfg.get("num_hidden_layers")
+    text_cfg = cfg.get("text_config")
+    if isinstance(text_cfg, dict):
+        return text_cfg.get("num_hidden_layers")
+    return None
+
 # ---------- quantizzazione: identica al C (glm.c) ----------
 def quant_int8(w, bits):                       # w: [O,I] f32 -> (qbytes U8 [O*I], scale f32 [O])
     qmax = (1 << (bits - 1)) - 1
@@ -145,6 +167,59 @@ def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], s
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
+# ---------- Kimi-K2.6 container unwrapping (prefix strip / vision drop / config flatten) ----------
+# K2.6 packages the SAME text backbone colibri already runs (byte-for-byte, validated
+# 32/32 TF + 20/20 decode) inside a bigger multimodal container: every text tensor name
+# gains a `language_model.` prefix, vision-tower + mm-projector tensors are bundled into
+# the same shards, and the config nests the real params under `text_config`. All three
+# must be undone BEFORE classify() (or anything else) inspects a name: classify()'s
+# layer_idx logic requires p[0]=="model" (a `language_model.` prefix makes it return -1
+# for EVERY tensor) and its embed/lm_head check is an EXACT string match (silently
+# reclassifies to the "q" fallback) -- neither raises, so this must happen at the single
+# point tensor names first enter the pipeline (_shard_tensor_groups' `for name in
+# f.keys()` loop), not "as names are written" downstream.
+_LM_PREFIX = "language_model."
+_VISION_PREFIXES = ("vision_tower.", "mm_projector.")
+
+def strip_lm_prefix(name):
+    """Strip K2.6's `language_model.` prefix, if present, so classify() sees the exact
+    same bare `model.layers...`/`lm_head.weight` names it always has for K2-Thinking
+    and GLM. A name without the prefix (K2-Thinking, GLM) passes through unchanged --
+    this is the byte-identical regression guard for those checkpoints."""
+    return name[len(_LM_PREFIX):] if name.startswith(_LM_PREFIX) else name
+
+def vision_drop_category(name):
+    """Returns "vision_tower" or "mm_projector" if `name` is a vision-tower or
+    mm-projector tensor (dropped, deliberately and reversibly -- colibri has no image
+    support anywhere in c/colibri.c, c/coli, or c/openai_server.py today), else None.
+    Checked BEFORE strip_lm_prefix/classify: vision names never carry a
+    `language_model.` prefix in K2.6's own naming, but even if they did, classify()
+    has no notion of a vision tensor and must never see one."""
+    if name.startswith("vision_tower."): return "vision_tower"
+    if name.startswith("mm_projector."): return "mm_projector"
+    return None
+
+def flatten_container_config(cfg):
+    """K2.6 nests the real text-backbone config under `text_config`, alongside a
+    `vision_config` and a top-level model_type of "kimi_k25"/architectures naming the
+    multimodal class. Emit `text_config` VERBATIM as the container's config.json --
+    carry NOTHING over from the top level. Measured (not reasoned): diffing K2-Thinking's
+    validated config.json (96 keys) against K2.6's text_config (95 keys) shows the only
+    deltas are torch_dtype->dtype, beta_fast 1.0->32.0, the vision regexes in
+    quantization_config.ignore, and transformers_version; bos/eos/pad_token_id are
+    already inside text_config with identical values, and text_config's own model_type
+    is already "kimi_k2". A merge like {**text_config, **cfg} would restore the TOP
+    level's model_type ("kimi_k25"), and both chat-template selectors compare EXACTLY to
+    "kimi_k2" -- so it would silently fall back to GLM's template and emit
+    `[gMASK]<sop>...` through a Kimi tokenizer. Fluent garbage, no error.
+    A flat config (K2-Thinking, GLM: no `text_config` key) passes through unchanged --
+    this is the byte-identical regression guard for those checkpoints; callers should
+    keep using the original bytes (shutil.copy) rather than round-tripping this dict
+    back through json.dump for the flat case, so formatting/key-order never drifts."""
+    if isinstance(cfg, dict) and isinstance(cfg.get("text_config"), dict):
+        return cfg["text_config"]
+    return cfg
+
 # ---------- classificazione dei tensori ----------
 def layer_idx(name):
     p = name.split(".")
@@ -154,10 +229,17 @@ def layer_idx(name):
     return -1
 
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
+    # Defense in depth, on top of _shard_tensor_groups stripping the prefix before
+    # calling classify(): strip it here too so classify() is correct no matter what a
+    # caller passes it -- its layer_idx logic requires p[0]=="model" (a still-prefixed
+    # name returns -1 for EVERY layer) and its embed/lm_head check is an exact string
+    # match (silently reclassifies to the "q" fallback). idempotent: a name without the
+    # prefix (K2-Thinking, GLM) is returned unchanged.
+    name = strip_lm_prefix(name)
     if name.endswith("_scale_inv"): return "consumed"   # FP8 base: gestito col suo peso
     # NVFP4 (modelopt): i sidecar delle scale sono consumati insieme al loro U8 .weight.
     # EN: NVFP4 (modelopt): scale sidecars are consumed together with their U8 .weight.
-    if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
+    if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".weight_shape")): return "consumed"
     li = layer_idx(name)
     if keep_idx:
         # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
@@ -171,11 +253,13 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
         if li >= n_layers: return "skip"                 # layer MTP (78)
         if any(k in name for k in ["indexer", "indexers_proj", "eh_proj",
                                     "enorm", "hnorm", "shared_head"]): return "skip"
+    if name.endswith("rotary_emb.inv_freq"): return "skip"   # K2 per-layer RoPE buffer; engine derives from theta
     if name.endswith("e_score_correction_bias"): return "f32"
     if name.endswith("mlp.gate.weight"): return "f32"    # router (NON gate_proj)
     if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
     if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
-    if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
+    if ".mlp.experts." in name and name.endswith(".weight"): return "x"          # expert ROUTED (streaming)
+    if ".mlp.experts." in name and name.endswith(".weight_packed"): return "x"    # K2 compressed-tensors int4 expert
     # Split resident weights by type for mixed-precision control:
     #   "sh" = shared expert (fires on every token, highest sensitivity)
     #   "o"  = o_proj attention (reconstructs output, biggest attn tensor)
@@ -190,6 +274,9 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if any(name.endswith(k) for k in ("mlp.gate_proj.weight", "mlp.up_proj.weight",
                                        "mlp.down_proj.weight")): return "dmlp"
     if name.endswith(".weight"): return "q"              # fallback: other resident weights
+    if name.endswith(".weight_packed"):
+        raise SystemExit(f"unexpected compressed-tensors int4 tensor outside routed experts: "
+                          f"{name} — this converter only transcodes .mlp.experts.*.weight_packed")
     return "f32"
 
 # ---------- dequant NVFP4 (modelopt) di UN tensore expert -> f32 [O,I] ----------
@@ -235,6 +322,85 @@ def dequant_nvfp4(f, name):
     sc = bscale.repeat_interleave(GS, dim=1)[:, :I]               # blocco parziale di coda: slice a I
     return (w4 * sc * gscale).numpy()
 
+# ---------- compressed-tensors 'pack-quantized' int4 (Kimi K2) ----------
+def unpack_compressed_int4(f, packed_name):
+    """compressed-tensors W4A16 symmetric int4 -> (codes int8 [O,I] in [-8,7],
+    scale f32 [O, ngroups]).  Layout — verified against the compressed-tensors
+    reference decoder (real K2 shard model-00002-of-000062.safetensors,
+    layer-1 routed experts, 6/6 gate/up/down_proj tensors bit-identical, w_maxdiff=0.0):
+      <base>.weight_packed  int32 [O, ceil(I/8)] : 8 nibbles per word, LSB = lowest column,
+                                                   OFFSET-BINARY: value = nibble - 8 (nibble
+                                                   0..15 -> value -8..7). NOT two's complement
+                                                   (an earlier version of this function got
+                                                   that wrong — caught by the reference cross-check).
+                                                   This is also exactly colibri's own fmt=4
+                                                   convention (nibble = value + 8).
+      <base>.weight_scale   [O, ceil(I/32)]      : per-group scale (bf16/fp16 -> f32)
+      <base>.weight_shape   [2]                  : original [O, I]; trims packing padding
+    Dequant convention is w = code * scale (symmetric, no zero point)."""
+    import torch
+    base = packed_name[:-len(".weight_packed")]
+    packed = f.get_tensor(packed_name).numpy().view(np.uint32)          # reinterpret int32 bits
+    scale = f.get_tensor(base + ".weight_scale").to(torch.float32).numpy()
+    shape = [int(v) for v in f.get_tensor(base + ".weight_shape").tolist()]
+    O, I = shape[0], shape[1]
+    # Loud guard, same class as dequant_nvfp4's scale-layout assert just above: refuse to
+    # silently misread a swizzled/padded shard layout (e.g. a future checkpoint revision)
+    # instead of corrupting it.
+    if packed.shape[0] != O:
+        raise ValueError(f"{packed_name}: weight_packed has {packed.shape[0]} rows, "
+                          f"expected {O} = weight_shape[0]; layout unexpected, refusing to corrupt")
+    ngroups = (I + 31) // 32
+    if scale.shape[1] != ngroups:
+        raise ValueError(f"{packed_name}: weight_scale has {scale.shape[1]} columns, expected "
+                          f"{ngroups} = ceil({I}/32); scale layout unexpected (swizzled/padded?), "
+                          "refusing to corrupt")
+    # Without this, packed.shape[1]*8 < I would make cols[:, :I] below silently CLIP (numpy
+    # slicing past the end is not an error) instead of raising -- wrong-shaped codes returned
+    # in silence. O/I come from the independent weight_shape tensor, so this can't be inferred.
+    nwords = (I + 7) // 8
+    if packed.shape[1] != nwords:
+        raise ValueError(f"{packed_name}: weight_packed has {packed.shape[1]} columns, expected "
+                          f"{nwords} = ceil({I}/8); layout unexpected (swizzled/padded?), "
+                          "refusing to corrupt")
+    pack_factor = 8
+    cols = np.empty((packed.shape[0], packed.shape[1] * pack_factor), np.int32)
+    for k in range(pack_factor):
+        cols[:, k::pack_factor] = (packed >> (4 * k)) & 0xF            # unsigned nibble 0..15
+    cols = cols[:, :I]
+    codes = (cols.astype(np.int16) - 8).astype(np.int8)                # offset-binary -> [-8,7]
+    return codes, scale
+
+def transcode_compressed_int4(codes, scale):
+    """Lossless int4 -> colibri fmt=4. codes int8 [O,I] in [-8,7], scale f32 [O,ngroups]
+    (group 32) -> (qbytes U8 [O*ceil(I/2)], s_flat BF16 [O*ngroups]).
+    nibble = code + 8, packed 2/byte along I (identical layout to quant_int4_grouped,
+    minus the quantization step: the codes are already the final int4 values).
+
+    Scales come back as ml_dtypes.bfloat16, NOT f32, unlike every other quant_* path
+    in this file. This is deliberate and scoped to K2's transcode only: the source
+    checkpoint's `*.weight_scale` tensors ARE bf16 (unpack_compressed_int4 upcasts them
+    to f32 only so the arithmetic above has a normal float type to work with) -- so
+    downcasting back to bf16 here is a lossless round-trip, not a precision loss, and it
+    halves the .qs bytes vs. storing them as f32 (container size + expert-streaming
+    bandwidth). The engine's fmt=4 loader upcasts bf16 -> f32 at load time. Do NOT copy
+    this bf16 downcast into quant_int4/quant_int4_grouped/quant_int8/etc.: those scales
+    are computed from scratch (amax/qmax) for GLM and other checkpoints, not sourced
+    from an already-bf16 tensor, so f32 there is the correct on-disk precision."""
+    import ml_dtypes
+    O, I = codes.shape
+    if scale.shape[0] != codes.shape[0]:
+        raise ValueError(f"transcode: scale has {scale.shape[0]} rows, codes has {codes.shape[0]}")
+    q = codes.astype(np.int32)
+    rb = (I + 1) // 2
+    out = np.zeros((O, rb), np.uint8)
+    v0 = (q[:, 0::2] + 8).astype(np.uint8)
+    out[:, :v0.shape[1]] = v0
+    if I > 1:
+        v1 = (q[:, 1::2] + 8).astype(np.uint8)
+        out[:, :v1.shape[1]] |= (v1 << 4)
+    return out.reshape(-1), scale.reshape(-1).astype(ml_dtypes.bfloat16)
+
 # ---------- dequant di un tensore (nvfp4 / fp8+scale a blocchi / bf16 / f32) ----------
 def dequant(f, name, keys):
     import torch
@@ -261,46 +427,251 @@ def dequant(f, name, keys):
 # record dict(PROJ_BITS) — this global is the definition those sites depend on.
 PROJ_BITS = {}
 
-def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
-                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None):
+def _shard_tensor_groups(path, n_layers, ebits, io_bits, xbits,
+                          keep_mtp=False, keep_idx=False, group_size=0, bits_map=None,
+                          vision_counts=None):
+    """Core per-tensor conversion logic for ONE shard, factored out of convert_shard so
+    both the whole-dict path (convert_shard, used unchanged by --repo) and the
+    chunked-flush path (convert_shard_to_files, used by --indir's parallel workers) share
+    IDENTICAL math -- this is what makes parallel+chunked output provably equal to the
+    old sequential output: there is exactly one place the quantization decisions are made.
+    This is ALSO the single point tensor names first enter the pipeline, so it is where
+    K2.6's `language_model.` prefix is stripped and its vision tensors are dropped --
+    BEFORE classify() (or anything else) inspects a name (see the module-level comment
+    above strip_lm_prefix/vision_drop_category for why the order matters).
+    `raw_name` (exactly as stored in the shard) is used for every safetensors lookup
+    (f.get_tensor/get_slice, unpack_compressed_int4, dequant) since that's the name the
+    FILE actually has; `name` (prefix-stripped) is used for classify() and as the output
+    tensor name, so the emitted container never carries the `language_model.` prefix.
+    `vision_counts`, if given a dict, is incremented in place per dropped category
+    ("vision_tower"/"mm_projector") -- the caller aggregates and reports the total.
+    Yields one GROUP (a list of (name, ndarray) pairs) per SOURCE tensor consumed from
+    the shard: 1 entry for f32-kept tensors, 2 entries (weight + weight.qs) for
+    quantized ones. Keeping weight+scale together in one group means a chunk-size flush
+    can never split a tensor from its own scale across two output files."""
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         keys = set(f.keys())
-        for name in f.keys():
+        for raw_name in f.keys():
+            vcat = vision_drop_category(raw_name)
+            if vcat is not None:
+                if vision_counts is not None:
+                    vision_counts[vcat] = vision_counts.get(vcat, 0) + 1
+                continue
+            name = strip_lm_prefix(raw_name)
             kind = classify(name, n_layers, keep_mtp, keep_idx)
             if kind in ("skip", "consumed"): continue
-            w = dequant(f, name, keys)
+            if kind == "x" and name.endswith(".weight_packed"):    # K2: lossless int4 transcode
+                base = name[:-len(".weight_packed")]
+                codes, scale = unpack_compressed_int4(f, raw_name)
+                q, s = transcode_compressed_int4(codes, scale)
+                yield [(base + ".weight", q), (base + ".weight.qs", s)]
+                continue
+            w = dequant(f, raw_name, keys)
             if kind == "f32":
-                out_dict[name] = w.astype(np.float32)
+                yield [(name, w.astype(np.float32))]
+                continue
+            # Resolve bits for this tensor type: use bits_map override if provided,
+            # otherwise fall back to the classic ebits/xbits/io_bits scheme.
+            if bits_map and kind in bits_map:
+                bits = bits_map[kind]
             else:
-                # Resolve bits for this tensor type: use bits_map override if provided,
-                # otherwise fall back to the classic ebits/xbits/io_bits scheme.
-                if bits_map and kind in bits_map:
-                    bits = bits_map[kind]
-                else:
-                    bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
-                # Any unknown kind that fell through classify as "q"
-                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
-                    bits = ebits
-                # Per-projection override for routed experts, applied on top of the type-level bits.
-                if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
-                    for proj, pb in PROJ_BITS.items():
-                        if f".{proj}.weight" in name: bits = pb; break
-                if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
-                    out_dict[name] = w.astype(np.float32); continue
-                if bits == E8:
-                    # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
-                    q, s = quant_e8(w)
-                elif bits == 3:
-                    # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
-                    q, s = quant_int3_g64(w)
-                elif group_size > 0 and bits <= 4:
-                    q, s = quant_int4_grouped(w, bits, group_size)
-                else:
-                    q, s = (quant_int2(w, bits) if bits <= 2 else
-                            quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
-                out_dict[name] = q
-                out_dict[name + ".qs"] = s
+                bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
+            # Any unknown kind that fell through classify as "q"
+            if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
+                bits = ebits
+            # Per-projection override for routed experts, applied on top of the type-level bits.
+            if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
+                for proj, pb in PROJ_BITS.items():
+                    if f".{proj}.weight" in name: bits = pb; break
+            if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
+                yield [(name, w.astype(np.float32))]
+                continue
+            if bits == E8:
+                # fmt=6 E8/IQ3 — routed-expert projections only, enforced in main().
+                q, s = quant_e8(w)
+            elif bits == 3:
+                # int3-g64 (fmt=5): inherently group-64, distinct from grouped-int4.
+                q, s = quant_int3_g64(w)
+            elif group_size > 0 and bits <= 4:
+                q, s = quant_int4_grouped(w, bits, group_size)
+            else:
+                q, s = (quant_int2(w, bits) if bits <= 2 else
+                        quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
+            yield [(name, q), (name + ".qs", s)]
+
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
+                  keep_mtp=False, keep_idx=False, group_size=0, bits_map=None,
+                  vision_counts=None):
+    for group in _shard_tensor_groups(path, n_layers, ebits, io_bits, xbits,
+                                       keep_mtp, keep_idx, group_size, bits_map,
+                                       vision_counts):
+        for name, arr in group:
+            out_dict[name] = arr
+
+def convert_shard_to_files(path, outdir, prefix, shard_idx, n_layers, ebits, io_bits, xbits,
+                           keep_mtp=False, keep_idx=False, group_size=0, bits_map=None,
+                           chunk_bytes=None, vision_counts=None):
+    """Convert ONE shard, flushing accumulated output tensors to
+    outdir/{prefix}{shard_idx:05d}-{chunk:03d}.safetensors whenever the accumulated raw
+    byte size (sum of ndarray.nbytes) reaches chunk_bytes -- this bounds a single
+    worker's peak resident memory to ~chunk_bytes plus one in-flight tensor, which is
+    what lets --jobs exceed the naive whole-shard-in-RAM parallelism cap.
+    chunk_bytes=None means never flush early: everything accumulates into ONE chunk
+    (chunk 000), written at the end -- this is --chunk-gb's "huge" setting used to get
+    one-file-per-shard sequential-equivalent behavior for the parallel==sequential proof.
+    Each chunk file is written to a `.tmp` sibling, fsync'd (file + directory entry),
+    then atomically renamed into place, so a crash mid-write never leaves a half-written
+    file under the final name for a resumed run to trip over.
+    Returns the list of chunk file BASENAMES written, in order (empty if the shard
+    produced no output tensors at all -- e.g. an --mtp/--indexer pass over a shard that
+    holds none of the wanted tensors)."""
+    from safetensors.numpy import save_file
+    chunk, nbytes, chunk_idx, written = {}, 0, 0, []
+    def flush():
+        nonlocal chunk, nbytes, chunk_idx
+        if not chunk: return
+        name = f"{prefix}{shard_idx:05d}-{chunk_idx:03d}.safetensors"
+        dest = os.path.join(outdir, name); tmp = dest + ".tmp"
+        save_file(chunk, tmp)
+        _fsync_path(tmp)
+        os.replace(tmp, dest)
+        _fsync_dir(dest)
+        written.append(name)
+        chunk_idx += 1; chunk = {}; nbytes = 0
+    for group in _shard_tensor_groups(path, n_layers, ebits, io_bits, xbits,
+                                       keep_mtp, keep_idx, group_size, bits_map,
+                                       vision_counts):
+        for name, arr in group:
+            chunk[name] = arr
+            nbytes += arr.nbytes
+        if chunk_bytes is not None and nbytes >= chunk_bytes:
+            flush()
+    flush()
+    return written
+
+def _available_ram_gb():
+    """Read MemAvailable from /proc/meminfo (Linux) -- the kernel's own estimate of how
+    much memory a new process can get without swapping (unlike MemFree, it accounts for
+    reclaimable caches/buffers, so it's the right number to size a worker pool against).
+    Falls back to a small, conservative value on any read failure (non-Linux, no /proc,
+    malformed line, ...) so --jobs auto still picks something rather than crashing --
+    a low fallback under-parallelizes instead of risking an OOM-driven false confidence."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kb = int(line.split()[1])
+                    return kb / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 4.0
+
+def _auto_jobs(chunk_gb):
+    """Default --jobs for --indir: min(cpu_count, RAM-bounded worker count). Each
+    worker's peak RSS is bounded to roughly chunk_gb (the chunk-flush threshold) plus
+    ~2 GB of interpreter/torch/numpy/safetensors-mmap overhead, so available RAM allows
+    floor(available_gb / (chunk_gb + 2)) workers before risking swap. chunk_gb<=0 (the
+    unbounded/one-chunk-per-shard setting) is treated as ~10 GB (typical raw shard
+    output size) here so auto-jobs still lands on a sane, RAM-safe worker count instead
+    of dividing by a non-positive number."""
+    cpu = os.cpu_count() or 1
+    cg = chunk_gb if chunk_gb > 0 else 10.0
+    ram_workers = max(1, int(_available_ram_gb() // (cg + 2)))
+    return max(1, min(cpu, ram_workers))
+
+def _fsync_path(path):
+    """fsync a file's own contents by path (used right before an atomic rename, so the
+    data is durable on disk before the name that points to it becomes visible)."""
+    fd = os.open(path, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def _fsync_dir(path):
+    """fsync the directory CONTAINING path (used right after an atomic rename, so the
+    rename itself -- the directory entry -- is durable across a crash, not just the
+    file's bytes). Standard POSIX durable-rename idiom: fsync data, rename, fsync dir."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd = os.open(d, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def _pool_worker_init(proj_bits):
+    """multiprocessing Pool initializer: runs once per worker process, before it services
+    any task. torch is not fork-safe, so --indir's parallel pool uses the 'spawn' start
+    method -- each worker is a genuinely fresh Python interpreter. Thread-count env vars
+    (OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS) are ALSO set by the parent (main(), right
+    before the Pool is created) so they are already present in the worker's OS
+    environment when THIS module's top-level `import numpy as np` runs during the
+    worker's bootstrap (which happens before this initializer, since spawn must import
+    the module to find the task function at all) -- setting them again here is a no-op
+    safety net for that path. torch.set_num_threads(1) is the one call that MUST happen
+    here rather than via env var: it's torch's own supported runtime knob and re-caps its
+    intra-op thread pool even though torch was already imported once during bootstrap.
+    Without this, N worker PROCESSES x M BLAS/torch threads each would oversubscribe the
+    machine's cores.
+    proj_bits restores this worker's own copy of the PROJ_BITS module global (per-
+    projection expert bit overrides read by _shard_tensor_groups) -- each worker is a
+    separate process, so the parent's CLI-driven PROJ_BITS mutation doesn't cross the
+    process boundary on its own; it must be re-applied here from the value captured in
+    the parent before the pool was created."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    import torch
+    torch.set_num_threads(1)
+    global PROJ_BITS
+    PROJ_BITS = proj_bits
+
+def _convert_one_shard_task(task):
+    """Top-level (module-level, hence picklable for multiprocessing 'spawn') unit of
+    work for --indir: convert ONE input shard to its chunk file(s), then write its
+    `.done` resume marker. Called either directly in the main process (--jobs 1 /
+    single-shard runs -- no Pool, no multiprocessing overhead at all) or inside a spawned
+    worker process via Pool.imap_unordered (--jobs > 1). Identical code either way, which
+    is what makes --jobs 1 and --jobs N provably produce the same per-shard output: there
+    is exactly one implementation of 'convert a shard', not a sequential one and a
+    separate parallel one.
+    The `.done` marker is written ONLY after its shard's chunk file(s) are fsync'd and
+    already visible under their final names (convert_shard_to_files fsyncs+renames each
+    chunk as it's flushed) -- so a resumed run that sees `{prefix}{shard_idx:05d}.done`
+    can trust every one of that shard's chunk files is complete on disk, never a partial
+    write from a killed worker.
+    Returns (shard_idx, input_basename, chunk_filenames, vision_counts) -- chunk_filenames
+    is [] for a shard that produced no output tensors at all (e.g. an --mtp/--indexer pass
+    over a shard holding none of the wanted tensors), mirroring the old empty-marker resume
+    semantics without needing a shared "" sentinel. vision_counts is this shard's OWN
+    {"vision_tower": n, "mm_projector": n} drop tally -- a fresh dict per call, returned
+    (not shared) because --jobs > 1 runs this in a separate spawned process, so a mutable
+    dict passed in would never be seen by the parent; main() sums these across all shards.
+    Before converting, removes any PRE-EXISTING {prefix}{shard_idx:05d}-*.safetensors
+    chunk files for this shard index: this shard is only reprocessed when its `.done`
+    marker is absent or one of ITS OWN recorded chunk files went missing (see the
+    marker_ok check in main()), which means whatever chunk files already sit at this
+    shard's index are leftovers from an earlier, incomplete attempt (interrupted mid-run,
+    or a chunk file deleted by hand without touching the marker). Without this cleanup, a
+    stale leftover chunk (e.g. `-003.safetensors` from a previous run that used a smaller
+    --chunk-gb and got killed after writing 4 chunks) would sit alongside this run's fresh
+    chunk files and reintroduce the SAME tensor names a second time -- the exact
+    duplicate-across-files hazard convert_shard_to_files's naming scheme exists to avoid."""
+    (sp, shard_idx, outdir, prefix, n_layers, ebits, io_bits, xbits,
+     keep_mtp, keep_idx, group_size, bits_map, chunk_bytes) = task
+    for stale in glob.glob(os.path.join(outdir, f"{prefix}{shard_idx:05d}-*.safetensors")):
+        os.remove(stale)
+    vision_counts = {}
+    written = convert_shard_to_files(sp, outdir, prefix, shard_idx, n_layers, ebits, io_bits, xbits,
+                                      keep_mtp=keep_mtp, keep_idx=keep_idx,
+                                      group_size=group_size, bits_map=bits_map,
+                                      chunk_bytes=chunk_bytes, vision_counts=vision_counts)
+    marker = os.path.join(outdir, f"{prefix}{shard_idx:05d}.done")
+    tmp = marker + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"input": os.path.basename(sp), "chunks": written}, f)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, marker)
+    _fsync_dir(marker)
+    return (shard_idx, os.path.basename(sp), written, vision_counts)
 
 def free_gb(p): return shutil.disk_usage(p).free / 1e9
 
@@ -333,12 +704,112 @@ def check_or_record_params(outdir, prefix, params):
 def _bits(v):                                   # "e8" -> fmt=6 marker; anything else an int width
     return E8 if v == E8 else int(v)
 
+SOURCE_VARIANT_MARKER = "_colibri_source_variant"
+KIMI_K25_SOURCE_VARIANT = "kimi_k25"
+
+def _write_config_file(src_path, dest_path):
+    """Copy config.json from src_path to dest_path, flattening a K2.6-style nested
+    config (see flatten_container_config) on the way through. Flat configs (GLM,
+    K2-Thinking: no `text_config` key, or an unparseable/malformed file) are copied
+    byte-for-byte via shutil.copy, UNCHANGED from before this function existed -- so
+    those containers stay byte-identical; only a genuinely nested config gets
+    rewritten, and only into `text_config`'s own bytes reserialized (nothing merged
+    in from the top level).
+
+    Nested (K2.6) configs additionally get one new top-level key stamped on:
+    `_colibri_source_variant: "kimi_k25"`. The alternative discriminator --
+    rope_scaling.beta_fast (1.0 vs 32.0), as used by c/coli's is_k26_of and
+    c/openai_server.py's detect_k26 -- is a YaRN *tuning* value with no semantic tie to
+    template selection: a future Kimi point release could change it for unrelated reasons
+    and silently flip a container into the wrong template (fluent garbage, no error). The
+    marker is a structural fact about which container this is, recorded once, here, at the
+    only point the converter actually knows it flattened a nested source.
+
+    Built as a NEW dict (`{**flat, marker: ...}`), not by mutating `flat` in place: `flat`
+    IS `cfg["text_config"]` by identity (flatten_container_config's own verbatim/identity
+    contract, pinned by test_flatten_container_config_emits_text_config_verbatim), and
+    mutating a dict a caller might still hold a reference to is exactly the kind of hidden
+    side effect immutable-update patterns exist to avoid. Adding a sibling key changes
+    neither that identity contract nor any existing key's value -- confirmed by re-reading
+    the pinning test, which asserts identity and specific key values, never "no other keys
+    were added" -- so this does not reopen the "emit text_config verbatim" promise."""
+    try:
+        cfg = json.loads(open(src_path).read())
+    except (OSError, ValueError):
+        cfg = None
+    # isinstance(...dict), not `"text_config" in cfg`: key-presence alone was true for
+    # `"text_config": null`, which sent a non-dict through flatten and wrote the literal
+    # `null` into the container's config.json, destroying the output config (recoverable
+    # only by re-converting). Requiring a dict makes that input fall through to the
+    # byte-for-byte shutil.copy below instead -- nothing is lost, and the engine then
+    # fails loudly on the unflattened config rather than on a `null` one. This also makes
+    # the guard agree with c/coli:171 and c/openai_server.py:2224, which already used
+    # isinstance. flatten_container_config applies the same test, so `flat` is
+    # necessarily a dict here and needs no defensive ternary.
+    if isinstance(cfg, dict) and isinstance(cfg.get("text_config"), dict):
+        flat = flatten_container_config(cfg)
+        out_cfg = {**flat, SOURCE_VARIANT_MARKER: KIMI_K25_SOURCE_VARIANT}
+        tmp = dest_path + ".tmp"
+        with open(tmp, "w") as out:
+            json.dump(out_cfg, out, indent=2)
+        os.replace(tmp, dest_path)
+    else:
+        shutil.copy(src_path, dest_path)
+
+def _write_metadata(src_dir, outdir):
+    """Copy the four metadata files; generate tokenizer.json from tiktoken.model when
+    the source has tiktoken but no tokenizer.json of its own (K2-style) -- FILE-driven,
+    not arch-gated: GLM ships tokenizer.json directly, so the four-file copy loop below
+    already satisfies it and this generation branch never fires (the `not os.path.exists`
+    guard is False). tiktoken.model (and tokenizer_config.json, which gen_kimi_tokenizer
+    also needs) may be temporarily absent mid-download (e.g. a partial local K2 mirror) --
+    warn and skip instead of crashing. The missing-metadata-file warning applies to ALL
+    sources (mirrors the pre-existing GLM missing-tokenizer.json warning this replaces);
+    the tiktoken-based generation is layered on top and, on success, removes
+    tokenizer.json from the missing list so it isn't double-reported.
+    gen_kimi_tokenizer.load_ranks() raises FileNotFoundError if called unconditionally,
+    so both the tiktoken.model existence check and the try/except below guard it."""
+    copied, missing = [], []
+    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
+        s = os.path.join(src_dir, fn)
+        if not os.path.exists(s):
+            missing.append(fn); continue
+        if fn == "config.json":
+            _write_config_file(s, os.path.join(outdir, fn))
+        else:
+            shutil.copy(s, outdir)
+        copied.append(fn)
+    if not os.path.exists(os.path.join(outdir, "tokenizer.json")):
+        tiktoken_path = os.path.join(src_dir, "tiktoken.model")
+        if not os.path.exists(tiktoken_path):
+            print(f"[META] WARNING: {tiktoken_path} not found; skipping tiktoken-based "
+                  "tokenizer.json generation — chat/serve need tokenizer.json")
+        else:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import gen_kimi_tokenizer
+            try:
+                gen_kimi_tokenizer.gen_kimi_tokenizer(src_dir, os.path.join(outdir, "tokenizer.json"))
+                copied.append("tokenizer.json(generated)")
+                if "tokenizer.json" in missing: missing.remove("tokenizer.json")
+            except (OSError, ValueError, KeyError) as ex:
+                # Broader than just OSError: a malformed/partial tokenizer_config.json or
+                # tiktoken.model (mid-download mirror, truncated file, unexpected schema)
+                # must warn-and-continue like a missing file does, not crash the WHOLE
+                # conversion (hours of shard work) over one metadata sidecar.
+                print(f"[META] WARNING: tokenizer.json generation failed ({type(ex).__name__}: {ex}); "
+                      "skipping — chat/serve need tokenizer.json")
+    print(f"[META] {outdir}: {', '.join(copied) if copied else 'nothing'}")
+    if missing:
+        print(f"[META] WARNING: not found in {src_dir}: {', '.join(missing)}"
+              + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=None)
     ap.add_argument("--indir", default=None)
     ap.add_argument("--outdir", required=False)
-    ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
+    ap.add_argument("--ebits", type=int, default=8)      # bit residenti: default LOSSLESS int8
+                                                          # (GLM's `coli convert` passes --ebits 4 explicitly)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
     ap.add_argument("--xbits", type=_bits, default=None) # bit degli expert ROUTED (streaming), o "e8" (fmt=6); default=ebits
     # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
@@ -372,9 +843,26 @@ def main():
         help="bits for down_proj in routed experts. Default=xbits")
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
+    ap.add_argument("--jobs", type=int, default=0,
+        help="--indir ONLY: shards converted in parallel worker processes. 0 (default) = "
+             "auto, min(cpu_count, available_RAM_GB // (chunk-gb + 2)) -- RAM-bounded so "
+             "N workers x chunk-gb peak each don't exceed physical memory. 1 = sequential, "
+             "in-process, no multiprocessing (today's original --indir behavior, byte-for-"
+             "byte identical conversion math). --repo is unaffected: it stays the single-"
+             "process disk-safe download loop regardless of --jobs.")
+    ap.add_argument("--chunk-gb", type=float, default=2.0,
+        help="--indir ONLY: a worker flushes its shard's accumulated output tensors to a "
+             "new out-{shard:05d}-{chunk:03d}.safetensors file once their raw byte size "
+             "reaches this many GB, bounding a worker's peak RAM to ~chunk-gb regardless "
+             "of the shard's total output size -- this is what lets --jobs exceed "
+             "available_RAM_GB // shard_output_gb. <=0 = unbounded (one chunk per shard, "
+             "matching pre-parallel behavior); use a small value (e.g. 0.5) to force "
+             "several chunks per shard for testing.")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-nvfp4", action="store_true",
         help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
+    ap.add_argument("--selftest-compressed-int4", action="store_true",
+        help="unit-test the compressed-tensors int4 unpack (synthetic pack->unpack round-trip, no network)")
     ap.add_argument("--mtp", action="store_true",
         help="download and convert ONLY the MTP head (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
     ap.add_argument("--indexer", action="store_true",
@@ -383,10 +871,43 @@ def main():
              "repository (~756 GB of traffic) to retain only a few GB. Resumable per shard. "
              "Recommended: --ebits 8.")
     a = ap.parse_args()
-    if a.ebits is None:
-        # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
-        # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
-        a.ebits = 8 if (a.mtp or a.indexer) else 4
+
+    if a.selftest_compressed_int4:
+        # Runs before any other argparse post-processing (ebits defaulting, PLAN print, ...)
+        # so it works standalone with no other flags, like a selftest should — the pre-existing
+        # `[PLAN]` print further down assumes --repo/--indir is set and is out of scope to fix.
+        import torch
+        import numpy as np  # main() has another `import numpy as np` further down (nvfp4
+                             # selftest), which makes `np` function-local for all of main()
+                             # per Python scoping rules; rebind it here too so this branch
+                             # (which runs earlier) doesn't hit UnboundLocalError.
+        rng = np.random.default_rng(1); O, I, gs = 4, 64, 32
+        codes = rng.integers(-8, 8, size=(O, I)).astype(np.int8)
+        scale = rng.random((O, I // gs)).astype(np.float32) + 0.1
+        pf = 8; u = ((codes.astype(np.int32) + 8) & 0xF).astype(np.uint32)  # offset-binary
+                             # nibble (value -8..7 -> nibble 0..15), cast to uint32: keeps the
+                             # shift/OR chain below in the uint32 domain — NEP 50 promotion
+                             # turns `uint32 |= int32` into int64 and raises
+                             # UFuncOutputCastingError on numpy>=2 otherwise.
+        packed = np.zeros((O, I // pf), np.uint32)
+        for k in range(pf): packed |= (u[:, k::pf] << (4 * k))
+        class _F:
+            def __init__(s, d): s.d = d
+            def get_tensor(s, n): return s.d[n]
+        f = _F({"w.weight_packed": torch.from_numpy(packed.astype(np.int32)),
+                "w.weight_scale": torch.from_numpy(scale),
+                "w.weight_shape": torch.tensor([O, I], dtype=torch.int64)})
+        gc, gs_ = unpack_compressed_int4(f, "w.weight_packed")
+        assert np.array_equal(gc, codes) and np.allclose(gs_, scale), "compressed-int4 unpack round-trip FAILED"
+        print("[compressed-int4] synthetic pack->unpack round-trip: OK")
+        return
+
+    # --ebits now defaults to 8 (LOSSLESS) via argparse itself -- no arch-keyed
+    # resolution needed here anymore. testa MTP a int4 = acceptance ~0-4% (misurato,
+    # issue #8): il draft sbaglia sempre e la speculazione non parte mai. A int8:
+    # 39-59%, 2.2-2.8 token/forward -- the lossless default already covers --mtp and
+    # --indexer too, so this WARNING only fires when a caller EXPLICITLY lowers
+    # --ebits below 8 alongside --mtp.
     if a.mtp and a.ebits < 8 and a.group_size <= 0:
         # Non solo lossy: eh_proj ha ~20-30x di asimmetria di scala fra le due meta' di
         # colonna, quindi l'int4 per-riga (UNA scala per riga) arrotonda a ZERO l'intera
@@ -429,8 +950,24 @@ def main():
     mode = "MTP head only" if a.mtp else "DSA indexer only" if a.indexer else "main model"
     grp = f"grouped gs={a.group_size} (fmt=4)" if (a.group_size and a.ebits <= 4) else \
           (f"PER-ROW (grouped branch needs bits<=4; ebits={a.ebits} disables it)" if a.group_size else "per-row")
+    # Cosmetic-only: a pack-quantized source (K2-style compressed-tensors) transcodes its
+    # routed experts losslessly (unpack_compressed_int4 + transcode_compressed_int4) --
+    # --xbits is never consulted for them, so printing "x {xbits}-bit" here would be
+    # misleading. Best-effort local config.json peek, never raises: any failure just
+    # falls back to the original "x {xbits}-bit" wording, same as before this note existed.
+    # K2.6 nests quantization_config under text_config (flatten_container_config), so this
+    # checks there too when the flat key is absent.
+    x_note = f"{a.xbits}-bit"
+    if a.indir:
+        try:
+            src_cfg = json.loads(open(os.path.join(a.indir, "config.json")).read())
+            src_cfg = flatten_container_config(src_cfg)
+            if src_cfg.get("quantization_config", {}).get("format") == "pack-quantized":
+                x_note = "transcode (lossless, source is pack-quantized; --xbits ignored)"
+        except (OSError, ValueError, AttributeError):
+            pass
     print(f"[PLAN] mode: {mode} | source: {'local ' + a.indir if a.indir else 'download ' + a.repo} | "
-          f"experts {a.ebits}-bit, embed/lm_head {a.io_bits}-bit, x {a.xbits}-bit | {grp}")
+          f"experts {a.ebits}-bit, embed/lm_head {a.io_bits}-bit, x {x_note} | {grp}")
 
     if a.selftest_nvfp4:
         import torch
@@ -508,10 +1045,17 @@ def main():
               f"({'OK' if rel < 0.05 else 'HIGH'})")
         return
 
+    # n_layers from the checkpoint's OWN config.json, always -- inspection-driven,
+    # not gated on arch. --repo writes config.json into outdir's _meta only later
+    # (the re-read after download, below, redoes this once that lands).
+    cfg_src = a.indir or a.outdir           # --repo path writes config.json into outdir early
+    if "--n-layers" not in sys.argv:
+        n = read_n_layers_from_config(cfg_src)
+        if n: a.n_layers = n
+
     os.makedirs(a.outdir, exist_ok=True)
-    if a.indir:    # conversione locale (test)
+    if a.indir:    # conversione locale: PARALLELA e memory-bounded (vedi convert_shard_to_files)
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
-        from safetensors.numpy import save_file
         # #383: se l'indice c'e', i passaggi --mtp/--indexer convertono SOLO gli shard
         # che contengono i tensori richiesti (3 invece di scandire tutti i 141 — ogni
         # scansione a vuoto apre comunque uno shard da 5 GB). Senza indice: scansione
@@ -539,73 +1083,129 @@ def main():
         # Ora il ramo locale rispecchia il download path: prefisso corretto,
         # flag passate, shard vuoti saltati.
         prefix = "out-mtp-" if a.mtp else "out-idx-" if a.indexer else "out-"
-        # RIPRESA (#383): i nomi out-NNNNN contano gli shard EMESSI, non l'indice di
-        # input (gli shard senza tensori rilevanti non producono file), quindi "il
-        # file esiste" non basta per saltare il lavoro gia' fatto. Un manifest
-        # sidecar ricorda input -> output (o "vuoto") e con quali parametri: la
-        # ripresa salta solo cio' che combacia, e parametri diversi sulla stessa
-        # outdir vengono rifiutati invece di mescolare container (il modo #355).
-        # EN: RESUME (#383): out-NNNNN names count EMITTED shards, not the input
-        # EN: index (shards with no relevant tensors emit no file), so "the file
-        # EN: exists" is not enough to skip completed work. A sidecar manifest
-        # EN: records input -> output (or "empty") plus the conversion parameters:
-        # EN: resume skips only what matches, and different parameters on the same
-        # EN: outdir are refused instead of mixing containers (the #355 failure mode).
+
+        # RESUME (#383, now race-free under parallelism): output files are named by the
+        # INPUT shard's own index (out-{shard_idx:05d}-{chunk:03d}.safetensors), not a
+        # global emission counter -- a shared counter would race across worker
+        # processes. A per-shard `{prefix}{shard_idx:05d}.done` marker (written only
+        # after ALL of that shard's chunk files are fsync'd + already visible under
+        # their final names, see _convert_one_shard_task) is the resume checkpoint: its
+        # mere existence means the shard is fully done, whatever chunks it produced
+        # (possibly zero, for an --mtp/--indexer pass over a shard with none of the
+        # wanted tensors). The params-mixing guard (#355: a resumed run with DIFFERENT
+        # bits/group-size/etc. must not silently mix conversions in one outdir) is
+        # unchanged in spirit, now backed by the same check_or_record_params() helper
+        # the --repo download loops already use, instead of a hand-rolled duplicate.
+        # Upgrade guard: an outdir with a PRE-parallel in-progress conversion (older
+        # converter version) recorded its resume state in `.{prefix}progress.json` using
+        # a global emission counter (out-00000.safetensors, no chunk suffix) -- a naming
+        # and resume scheme this version's `.done`-marker logic doesn't recognize at all.
+        # Silently proceeding would reprocess every shard fresh under the NEW naming
+        # scheme while the OLD counter-named files stay behind unnoticed, and the C
+        # engine's glob would then load BOTH old and new copies of the same tensor names.
+        # Refuse instead of guessing: the fix is a fresh --outdir (or finish/clean up the
+        # old-style conversion with the previous converter version first).
+        old_progress = os.path.join(a.outdir, f".{prefix}progress.json")
+        if os.path.exists(old_progress):
+            print(f"ERROR: {old_progress} exists -- {a.outdir} has an in-progress "
+                  "conversion from an OLDER converter version (global-counter output "
+                  f"naming, e.g. {prefix}00000.safetensors with no chunk suffix), which "
+                  "this parallel/chunked version cannot safely resume in place. Use a "
+                  "fresh --outdir, or finish that conversion with the previous converter "
+                  "version first.")
+            return
         params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
                   "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
                   "proj_bits": dict(PROJ_BITS)}
-        prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
-        prog = {}
-        if os.path.exists(prog_path):
-            try: prog = json.loads(open(prog_path).read())
-            except (OSError, ValueError): prog = {}
-            if prog and prog.get("params") != params:
-                print(f"ERROR: {prog_path} records a conversion with {prog.get('params')};\n"
-                      f"       this run uses {params}. Refusing to mix conversions in the same "
-                      f"outdir — use a fresh --outdir (or delete the manifest and the "
-                      f"{prefix}*.safetensors shards to redo).")
-                return
-        done = prog.setdefault("shards", {}); prog["params"] = params
-        n = 0; fresh = 0; skipped = 0
+        if not check_or_record_params(a.outdir, prefix, params): return
+
+        chunk_bytes = None if a.chunk_gb <= 0 else int(a.chunk_gb * (1 << 30))
+        jobs = a.jobs if a.jobs > 0 else _auto_jobs(a.chunk_gb)
+        proj_bits_snapshot = dict(PROJ_BITS)   # each worker process needs its own copy (see _pool_worker_init)
+
+        tasks, skipped, skipped_with_output = [], 0, 0
         for i, sp in enumerate(shards):
-            key = os.path.basename(sp)
-            prev = done.get(key)                          # None = mai visto; "" = visto, vuoto; nome = emesso
-            if prev is not None and (prev == "" or os.path.exists(os.path.join(a.outdir, prev))):
-                if prev: n += 1
+            marker = os.path.join(a.outdir, f"{prefix}{i:05d}.done")
+            marker_ok, chunks_recorded = False, []
+            if os.path.exists(marker):
+                try:
+                    chunks_recorded = json.loads(open(marker).read()).get("chunks", [])
+                    # Defense in depth beyond the design's baseline "marker exists ->
+                    # skip": a marker only counts as done if every chunk file it names is
+                    # STILL present. Guards against a chunk file being deleted (by hand, by
+                    # a partial cleanup, ...) without also deleting the marker, which would
+                    # otherwise silently skip a shard whose on-disk output is incomplete.
+                    marker_ok = all(os.path.exists(os.path.join(a.outdir, c)) for c in chunks_recorded)
+                except (OSError, ValueError):
+                    marker_ok = False   # unparseable marker: safe default is NOT-done -> reprocess
+            if marker_ok:
                 skipped += 1
+                if chunks_recorded: skipped_with_output += 1
                 continue
-            out = {}
-            convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
-                          keep_mtp=a.mtp, keep_idx=a.indexer,
-                          group_size=a.group_size, bits_map=bits_map)
-            if not out:                                   # shard senza MTP/idx: niente file (come il download path)
-                done[key] = ""
-            else:
-                name = f"{prefix}{n:05d}.safetensors"
-                save_file(out, os.path.join(a.outdir, name))
-                done[key] = name; n += 1; fresh += 1
-            tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
-            with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
-            os.replace(tmp_prog, prog_path)
+            tasks.append((sp, i, a.outdir, prefix, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                          a.mtp, a.indexer, a.group_size, bits_map, chunk_bytes))
         if skipped: print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
-        # metadati per la conversione principale: gli stessi quattro file del download
-        # path — senza tokenizer.json chat/serve non partono. I passaggi mtp/idx vanno
-        # nella stessa outdir di un container gia' completo di metadati.
-        # EN: metadata for the main pass: the same four files as the download path —
-        # EN: chat/serve won't start without tokenizer.json. The mtp/idx passes target
-        # EN: an outdir whose container already has its metadata.
+
+        print(f"[PARALLEL] {len(tasks)} shard(s) to convert, --jobs {jobs}, chunk-gb="
+              f"{a.chunk_gb if a.chunk_gb > 0 else 'unbounded'}", flush=True)
+
+        results = []
+        if jobs <= 1 or len(tasks) <= 1:
+            # Sequential, IN-PROCESS, no multiprocessing at all: this is --jobs 1's
+            # "reproduce today's exact conversion behavior" path. It runs the exact same
+            # _convert_one_shard_task() every parallel worker runs below -- there is one
+            # implementation of "convert a shard", not a sequential one and a separate
+            # parallel one -- which is what makes --jobs 1 and --jobs N provably produce
+            # the same per-shard tensor content (proven by
+            # test_kimi_convert.py::test_parallel_matches_sequential).
+            for t in tasks:
+                r = _convert_one_shard_task(t)
+                results.append(r)
+                print(f"    -> shard {r[0]:05d} ({r[1]}): {len(r[2])} chunk file(s)", flush=True)
+        else:
+            import multiprocessing as mp
+            # Thread-limiting env vars set in the PARENT before spawning: a spawned
+            # child inherits os.environ at process-start time, so these are already
+            # present in the child's OS environment when THIS module's top-level
+            # `import numpy as np` (and any worker-side `import torch`) runs during the
+            # child's bootstrap -- which happens before _pool_worker_init even executes
+            # (spawn must import the module to find the task function at all).
+            # _pool_worker_init sets them again as a no-op safety net and additionally
+            # calls torch.set_num_threads(1), torch's own supported runtime knob for
+            # capping its intra-op thread pool. Without this, N worker PROCESSES x M
+            # BLAS/torch threads each would oversubscribe the machine's cores. 'spawn'
+            # (not the platform default, which is 'fork' on Linux) because torch is not
+            # fork-safe.
+            for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+                os.environ[var] = "1"
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=jobs, initializer=_pool_worker_init,
+                          initargs=(proj_bits_snapshot,)) as pool:
+                for r in pool.imap_unordered(_convert_one_shard_task, tasks):
+                    results.append(r)
+                    print(f"    -> shard {r[0]:05d} ({r[1]}): {len(r[2])} chunk file(s)", flush=True)
+
+        fresh = sum(1 for r in results if r[2])
+        n = fresh + skipped_with_output
+        # Sum each shard's own vision-drop tally (r[3]) here in the PARENT: --jobs > 1
+        # runs _convert_one_shard_task in separate spawned processes, so this is the
+        # only place the per-shard counts can be combined into one total.
+        vision_totals = {}
+        for r in results:
+            for cat, cnt in r[3].items():
+                vision_totals[cat] = vision_totals.get(cat, 0) + cnt
+        total_dropped = sum(vision_totals.values())
+        if total_dropped:
+            print(f"[VISION] dropped {total_dropped} tensors "
+                  f"({vision_totals.get('vision_tower', 0)} vision_tower, "
+                  f"{vision_totals.get('mm_projector', 0)} mm_projector) — text-only container")
+        # Metadata step runs ONCE, in the parent, after every worker has finished --
+        # config/tokenizer copy+generation only needs to happen once per outdir, not
+        # once per shard/worker (and gen_kimi_tokenizer isn't safe to fan out anyway).
         if not a.mtp and not a.indexer:
-            copied, missing = [], []
-            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
-                src = os.path.join(a.indir, fn)
-                if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
-                else: missing.append(fn)
-            print(f"[META] copied from {a.indir}: {', '.join(copied) if copied else 'nothing'}")
-            if missing:
-                print(f"[META] WARNING: not found in {a.indir}: {', '.join(missing)}"
-                      + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
+            _write_metadata(a.indir, a.outdir)
         tag = "MTP" if a.mtp else "indexer" if a.indexer else "main"
-        print(f"converted {fresh} {tag} shard(s), {n} in container -> {a.outdir} ({prefix}NNNNN)")
+        print(f"converted {fresh} {tag} shard(s), {n} in container -> {a.outdir} ({prefix}NNNNN-NNN)")
         return
 
     # reale: scarica shard per shard, converte, cancella
@@ -828,9 +1428,20 @@ def main():
     if not shards:
         print("ERROR: no .safetensors shards found in this repository.", flush=True)
         return
-    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
-        try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
+    meta_dir = os.path.join(a.outdir, "_meta"); os.makedirs(meta_dir, exist_ok=True)
+    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json",
+               "tiktoken.model"]:
+        # hf_hub_download(..., local_dir=meta_dir) already returns meta_dir/fn; a shutil.copy
+        # of that path onto meta_dir was copying the file onto itself (SameFileError, silently
+        # swallowed by the except below) -- just download, nothing left to copy.
+        try: hf_hub_download(a.repo, fn, local_dir=meta_dir)
         except Exception: pass
+    # re-read n_layers now that config.json is present (repo path): the early read
+    # above ran before download, when meta_dir's config.json didn't exist yet.
+    if "--n-layers" not in sys.argv:
+        n = read_n_layers_from_config(meta_dir)
+        if n: a.n_layers = n
+    _write_metadata(meta_dir, a.outdir)
     tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
     if a.mtp:
         params = {"ebits": a.ebits, "io_bits": a.io_bits, "xbits": a.xbits,
@@ -883,6 +1494,7 @@ def main():
               "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
               "proj_bits": dict(PROJ_BITS)}
     if not check_or_record_params(a.outdir, "out-", params): return
+    vision_totals = {}   # single-process download loop -- a plain shared dict is fine here
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
@@ -890,13 +1502,19 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size,
+                                 bits_map=bits_map, vision_counts=vision_totals)
         save_file(out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
             if os.path.isfile(blob): os.remove(blob)
         print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)
     shutil.rmtree(tmp, ignore_errors=True)
+    total_dropped = sum(vision_totals.values())
+    if total_dropped:
+        print(f"[VISION] dropped {total_dropped} tensors "
+              f"({vision_totals.get('vision_tower', 0)} vision_tower, "
+              f"{vision_totals.get('mm_projector', 0)} mm_projector) — text-only container")
     print("DONE." if i == len(shards)-1 else "INTERRUPTED (rerun to resume).")
 
 if __name__ == "__main__":

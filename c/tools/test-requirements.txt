@@ -1,0 +1,26 @@
+# Deps for the Python test suite (`make -C c test-python`). The ci.yml `python`
+# job installs exactly this file, and setup-python hashes it for the pip cache
+# key -- same arrangement as oracle-requirements.txt.
+#
+# Why these four:
+#   pytest       -- tests/test_kimi_convert.py is bare-pytest-function style;
+#                   `unittest discover` collects ZERO of its 36 tests because it
+#                   only finds unittest.TestCase subclasses.
+#   numpy        -- imported at module scope by tests/test_kimi_convert.py and by
+#                   tools/convert_fp8_to_int4.py itself (line 29).
+#   torch        -- the int4 pack/unpack round-trip tests build fixture tensors
+#                   through a FakeST safetensors stand-in. CPU wheel: these are
+#                   tiny hand-built arrays, no GPU wanted (same call as the
+#                   inkling oracle).
+#   safetensors  -- lazily imported inside the converter's shard read/write paths
+#                   (lines 452, 529, 974, 1403), which several tests exercise.
+#
+# transformers is deliberately NOT here: no test in c/tests imports it. The
+# tiny-K2 fixture generator (tools/make_k2tiny.py) does, but it is not part of
+# test-python -- it needs a real checkpoint and is run by hand.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+pytest
+numpy
+torch
+safetensors

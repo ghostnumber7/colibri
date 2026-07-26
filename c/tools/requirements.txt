@@ -5,6 +5,7 @@ torch>=2.4
 safetensors>=0.4
 huggingface-hub>=0.24
 numpy>=1.26
+ml_dtypes>=0.3          # bf16 dtype: K2 transcode .qs scales (fmt=4) and the NVFP4 selftest
 tokenizers>=0.20
 transformers>=5.11        # <5.11 applies split-half Llama RoPE and drifts vs the engine's interleaved MLA (issue #281)
 datasets>=2.20
