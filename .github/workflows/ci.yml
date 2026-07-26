@@ -208,5 +208,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: c/tools/test-requirements.txt
+      - name: Install test deps
+        run: pip install -r c/tools/test-requirements.txt
+      # Runs the same target developers run, so CI and local agree by construction.
       - name: Python test suite
-        run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
+        run: make -C c test-python

@@ -199,9 +199,13 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_bf16_scales$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_yarn_rope$(EXE) tests/test_qscales$(EXE) tests/test_chat_template$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
+# pin_arena_bind (test_pin_arena.c's only subject) lives inside #ifdef __linux__ in
+# colibri.c -- on darwin/mingw the symbol doesn't exist, so this must stay out of the
+# unconditional TEST_BINS list above or every non-Linux build/test-c fails to link.
+TEST_BINS += tests/test_pin_arena$(EXE)
 endif
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
@@ -432,6 +436,21 @@ tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok
 tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_bf16_scales$(EXE): tests/test_bf16_scales.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_yarn_rope$(EXE): tests/test_yarn_rope.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qscales$(EXE): tests/test_qscales.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_chat_template$(EXE): tests/test_chat_template.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_pin_arena$(EXE): tests/test_pin_arena.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -471,8 +490,38 @@ tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
 
+# test-python needs torch/numpy/pytest (test_kimi_convert.py,
+# test_kimi_tokenizer.py, test_make_k2tiny_ref_path.py); system python3 typically
+# lacks them, so prefer the project venv (<repo>/.venv) and fall back to $(PYTHON).
+#
+# pytest is preferred over `unittest discover` because discover only collects
+# unittest.TestCase subclasses: test_kimi_convert.py and test_kimi_tokenizer.py are
+# bare `def test_*()` modules and contribute zero tests under discover.
+VENV_PYTHON := $(CURDIR)/../.venv/bin/python
+HAVE_VENV := $(wildcard $(VENV_PYTHON))
+ifneq (,$(HAVE_VENV))
+TEST_PYTHON := $(VENV_PYTHON)
+else
+TEST_PYTHON := $(PYTHON)
+endif
+# Probed on TEST_PYTHON outside the venv conditional: CI pip-installs the deps into
+# the system interpreter and has no repo-local .venv.
+HAVE_PYTEST := $(shell $(TEST_PYTHON) -c "import pytest" 2>/dev/null && echo yes)
+
+ifeq ($(HAVE_PYTEST),yes)
+TEST_CMD := $(TEST_PYTHON) -m pytest tests -q
+else
+TEST_CMD := $(TEST_PYTHON) -m unittest discover -s tests -p 'test_*.py'
+endif
+
 test-python:
-	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+ifneq ($(HAVE_PYTEST),yes)
+	@echo "WARNING: pytest not importable -- falling back to 'unittest discover',"
+	@echo "WARNING: which does not collect the bare-pytest-function suites"
+	@echo "WARNING: (tests/test_kimi_convert.py, tests/test_kimi_tokenizer.py)."
+	@echo "WARNING: install deps with: pip install -r tools/test-requirements.txt"
+endif
+	$(TEST_CMD)
 
 test: test-c test-python
 
