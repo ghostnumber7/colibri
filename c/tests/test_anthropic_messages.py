@@ -13,6 +13,7 @@ is the reference client from the issue — not merely that the handler returns 2
 import json
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -327,6 +328,46 @@ class MessagesHTTPTest(unittest.TestCase):
                          [(0, "thinking"), (1, "tool_use")])
         self.assertNotIn("</think>", raw)
         self.assertEqual(payloads[-2]["delta"]["stop_reason"], "tool_use")
+
+    def test_dispatches_kimi_k2_renderer_not_glm(self):
+        """Final whole-branch review, I-2: `/v1/messages` called `render_chat` (GLM's
+        template) unconditionally, ignoring ARCH. A client pointed at a K2 server (Claude
+        Code is the reference client for this endpoint) got GLM's `[gMASK]<sop><|user|>...`
+        garbage-generating template. Must route through the same renderer-selection dict
+        `chat_completion` already uses, exactly like `test_chat_completion_dispatches_kimi_k2_renderer`
+        does for the OpenAI endpoint."""
+        with patch("openai_server.ARCH", "kimi_k2"):
+            with self.post(self.base_body()) as response:
+                json.load(response)
+        prompt = self.engine.prompts[-1]
+        self.assertIn("<|im_user|>user<|im_middle|>Hi<|im_end|>"
+                      "<|im_assistant|>", prompt)
+        self.assertNotIn("[gMASK]<sop>", prompt)
+        self.assertNotIn("<|user|>", prompt)
+
+    def test_dispatches_k26_renderer_via_is_k26_global(self):
+        """Same gap as test_dispatches_kimi_k2_renderer_not_glm, one layer deeper: ARCH==
+        "kimi_k2" alone can't distinguish K2.6 from K2-Thinking (both report that model_type
+        once converted) -- IS_K26 must be threaded through this dispatch too, exactly like
+        chat_completion's OpenAI-endpoint dispatch. No `thinking` field in the request body
+        -> enable_thinking defaults False -> K2.6's nothink marker."""
+        with patch("openai_server.ARCH", "kimi_k2"), patch("openai_server.IS_K26", True):
+            with self.post(self.base_body()) as response:
+                json.load(response)
+        prompt = self.engine.prompts[-1]
+        self.assertEqual(prompt,
+            "<|im_user|>user<|im_middle|>Hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>")
+        self.assertNotIn("You are Kimi", prompt)
+
+    def test_dispatches_k26_renderer_thinking_enabled(self):
+        with patch("openai_server.ARCH", "kimi_k2"), patch("openai_server.IS_K26", True):
+            with self.post(self.base_body(thinking={"type": "enabled"})) as response:
+                json.load(response)
+        prompt = self.engine.prompts[-1]
+        self.assertEqual(prompt,
+            "<|im_user|>user<|im_middle|>Hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think>")
 
     def test_unsupported_fields_refuse_loudly(self):
         for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):

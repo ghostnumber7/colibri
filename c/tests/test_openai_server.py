@@ -14,8 +14,9 @@ from pathlib import Path
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
-                           _engine_error, generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, serve, split_thinking_reply, stop_policy)
+                           _engine_error, detect_arch, detect_k26, generation_options,
+                           parse_tool_calls, read_engine_turn, render_chat, render_chat_k2,
+                           serve, split_thinking_reply, stop_policy)
 
 
 class FakeEngine:
@@ -77,6 +78,106 @@ class TemplateTest(unittest.TestCase):
             render_chat([{"role": "user", "content": "Hi"}], True, "high"),
             "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>",
         )
+
+    def test_render_chat_k2_default_preamble_and_no_think(self):
+        """Byte-exact match against chat_template.jinja's actual render (verified against
+        jinja2): default system preamble when the caller supplies none, and NO
+        <think>/<think></think> at all in the generation prompt."""
+        self.assertEqual(
+            render_chat_k2([{"role": "user", "content": "hello"}]),
+            "<|im_system|>system<|im_middle|>"
+            "You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>"
+            "<|im_user|>user<|im_middle|>hello<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|>",
+        )
+
+    def test_render_chat_k2_explicit_system_skips_default_preamble(self):
+        self.assertEqual(
+            render_chat_k2([
+                {"role": "system", "content": "custom"},
+                {"role": "user", "content": "hi"},
+            ]),
+            "<|im_system|>system<|im_middle|>custom<|im_end|>"
+            "<|im_user|>user<|im_middle|>hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|>",
+        )
+
+    def test_render_chat_k2_history_assistant_turn_gets_empty_think(self):
+        self.assertEqual(
+            render_chat_k2([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "there"},
+                {"role": "user", "content": "again"},
+            ]),
+            "<|im_system|>system<|im_middle|>"
+            "You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>"
+            "<|im_user|>user<|im_middle|>hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>there<|im_end|>"
+            "<|im_user|>user<|im_middle|>again<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|>",
+        )
+
+    def test_render_chat_k2_ignores_enable_thinking_and_reasoning_effort(self):
+        """K2's template has no lever for these -- unlike GLM's <think></think>-means-
+        nothink convention, K2-Thinking decides on its own whether to open <think>."""
+        plain = render_chat_k2([{"role": "user", "content": "hi"}])
+        self.assertEqual(render_chat_k2([{"role": "user", "content": "hi"}], True, "high"), plain)
+
+    def test_render_chat_k2_rejects_tools(self):
+        with self.assertRaisesRegex(APIError, "not wired up for the Kimi-K2 engine"):
+            render_chat_k2([{"role": "user", "content": "hi"}],
+                          tools=[{"type": "function", "function": {"name": "f"}}])
+
+    def test_render_chat_k26_no_default_preamble_nothink(self):
+        """Byte-exact match against Kimi-K2.6's REAL chat_template.jinja, rendered through
+        transformers' Jinja2 env. Unlike K2-Thinking, K2.6 injects NO default system
+        preamble at all, and its generation prompt ALWAYS ends in a think marker."""
+        self.assertEqual(
+            render_chat_k2([{"role": "user", "content": "hello"}], is_k26=True),
+            "<|im_user|>user<|im_middle|>hello<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>",
+        )
+
+    def test_render_chat_k26_think_marker_follows_enable_thinking(self):
+        self.assertEqual(
+            render_chat_k2([{"role": "user", "content": "hello"}], True, "high", is_k26=True),
+            "<|im_user|>user<|im_middle|>hello<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think>",
+        )
+
+    def test_render_chat_k26_explicit_system_still_skips_default_preamble(self):
+        """K2.6's real template has NO default-preamble block at all -- unlike
+        K2-Thinking, an explicit system message changes nothing about whether the
+        default gets injected (there is no default to suppress)."""
+        self.assertEqual(
+            render_chat_k2([
+                {"role": "system", "content": "custom"},
+                {"role": "user", "content": "hi"},
+            ], is_k26=True),
+            "<|im_system|>system<|im_middle|>custom<|im_end|>"
+            "<|im_user|>user<|im_middle|>hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>",
+        )
+
+    def test_render_chat_k26_history_assistant_turn_gets_empty_think(self):
+        """Identical to K2-Thinking's handling of past assistant turns -- both share
+        this part of the real template."""
+        self.assertEqual(
+            render_chat_k2([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "there"},
+                {"role": "user", "content": "again"},
+            ], is_k26=True),
+            "<|im_user|>user<|im_middle|>hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>there<|im_end|>"
+            "<|im_user|>user<|im_middle|>again<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>",
+        )
+
+    def test_render_chat_k26_rejects_tools(self):
+        with self.assertRaisesRegex(APIError, "not wired up for the Kimi-K2 engine"):
+            render_chat_k2([{"role": "user", "content": "hi"}], is_k26=True,
+                          tools=[{"type": "function", "function": {"name": "f"}}])
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
@@ -140,6 +241,149 @@ class TemplateTest(unittest.TestCase):
             self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
         with self.assertRaises(APIError):
             stop_policy({"x_colibri_ignore_leading_stop": "yes"}, True)
+
+    def test_kimi_k2_gets_no_implicit_glm_stops(self):
+        """Regression guard for the silent-truncation bug this task fixes: before ARCH
+        auto-detect learned about kimi_k2, a K2 checkpoint resolved to ARCH=="glm" and
+        silently inherited DEFAULT_CHAT_STOP_SEQUENCES ("<|user|>", "<|observation|>") --
+        strings meaningless to K2 that could still appear in ordinary generated text and
+        truncate a reply with no diagnostic. K2 must behave like inkling: no implicit stops."""
+        with patch("openai_server.ARCH", "kimi_k2"):
+            self.assertEqual(stop_policy({}, True), ((), False))
+            self.assertEqual(stop_policy({"stop": "END"}, True), (("END",), False))
+
+
+class DetectArchTest(unittest.TestCase):
+    """--arch auto: model_type -> chat-template family. Before this task, a Kimi-K2
+    checkpoint (model_type == "kimi_k2") fell through to the "glm" default silently."""
+
+    def test_kimi_k2(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({"model_type": "kimi_k2"}))
+            self.assertEqual(detect_arch(model), "kimi_k2")
+
+    def test_inkling_substring_match_preserved(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({"model_type": "some-inkling-variant"}))
+            self.assertEqual(detect_arch(model), "inkling")
+
+    def test_glm_default(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
+            self.assertEqual(detect_arch(model), "glm")
+
+    def test_missing_config_fails_soft_to_glm(self):
+        with tempfile.TemporaryDirectory() as model:
+            self.assertEqual(detect_arch(model), "glm")
+
+    def test_malformed_config_fails_soft_to_glm(self):
+        """A config.json that exists but is not valid JSON must fail soft to the "glm"
+        default, exactly as a missing one does -- detect_arch catches JSONDecodeError
+        alongside OSError. Covered indirectly by CmdServeTest, but pinned here too so the
+        guarantee is asserted at detect_arch's own layer, matching DetectK26Test's
+        test_malformed_config_fails_soft_to_false."""
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text("not json")
+            self.assertEqual(detect_arch(model), "glm")
+
+    def test_valid_json_but_not_an_object_fails_soft_to_glm(self):
+        """`null`/`[]`/`"x"`/`3` are all VALID json, so json.load succeeds and neither
+        OSError nor JSONDecodeError fires -- the subsequent .get raised AttributeError
+        straight out of detect_arch, and cmd_serve calls it directly, so `coli serve`
+        died with a traceback instead of failing soft."""
+        for body in ("null", "[]", '"x"', "3"):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as model:
+                (Path(model) / "config.json").write_text(body)
+                self.assertEqual(detect_arch(model), "glm")
+
+
+class DetectK26Test(unittest.TestCase):
+    """detect_k26: K2.6 vs K2-Thinking after both flatten to model_type=="kimi_k2".
+    rope_scaling.beta_fast is the discriminator -- verified directly against both real
+    checkpoints' config.json (K2-Thinking: 1.0; K2.6: 32.0), not assumed."""
+
+    def test_k26_shaped_config_beta_fast_32(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({
+                "model_type": "kimi_k2",
+                "rope_scaling": {"type": "yarn", "beta_fast": 32.0, "beta_slow": 1.0},
+            }))
+            self.assertTrue(detect_k26(model))
+
+    def test_k2_thinking_shaped_config_beta_fast_1_is_not_k26(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({
+                "model_type": "kimi_k2",
+                "rope_scaling": {"type": "yarn", "beta_fast": 1.0, "beta_slow": 1.0},
+            }))
+            self.assertFalse(detect_k26(model))
+
+    def test_no_rope_scaling_at_all_is_not_k26(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({"model_type": "kimi_k2"}))
+            self.assertFalse(detect_k26(model))
+
+    def test_reads_through_nested_text_config(self):
+        """A raw (unconverted) K2.6 source repo nests rope_scaling under text_config --
+        detect_k26 must still find it, not just the already-flattened container shape."""
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({
+                "model_type": "kimi_k25",
+                "text_config": {"model_type": "kimi_k2",
+                               "rope_scaling": {"type": "yarn", "beta_fast": 32.0}},
+            }))
+            self.assertTrue(detect_k26(model))
+
+    def test_missing_config_fails_soft_to_false(self):
+        with tempfile.TemporaryDirectory() as model:
+            self.assertFalse(detect_k26(model))
+
+    def test_malformed_config_fails_soft_to_false(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text("not json")
+            self.assertFalse(detect_k26(model))
+
+    def test_valid_json_but_not_an_object_fails_soft_to_false(self):
+        """Same trap as DetectArchTest's: valid JSON that is not an object parses fine,
+        and detect_k26's .get calls sit OUTSIDE its try, so an isinstance guard -- not a
+        wider except -- is what keeps the fail-soft contract."""
+        for body in ("null", "[]", '"x"', "3"):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as model:
+                (Path(model) / "config.json").write_text(body)
+                self.assertFalse(detect_k26(model))
+
+    def test_marker_wins_over_beta_fast_1_fallback(self):
+        """The converter stamps an explicit top-level
+        `_colibri_source_variant: "kimi_k25"` marker onto a flattened K2.6 container's
+        config.json, since beta_fast is a YaRN tuning value with no semantic tie to
+        template choice. The marker must decide even when beta_fast alone would say
+        K2-Thinking (beta_fast=1.0 here)."""
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({
+                "model_type": "kimi_k2", "_colibri_source_variant": "kimi_k25",
+                "rope_scaling": {"type": "yarn", "beta_fast": 1.0, "beta_slow": 1.0},
+            }))
+            self.assertTrue(detect_k26(model))
+
+    def test_marker_present_but_wrong_value_is_decisive_not_k26(self):
+        """A marker present but not "kimi_k25" is decisive as "not K2.6" -- only an
+        ABSENT marker falls through to the beta_fast fallback, not merely a mismatch."""
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({
+                "model_type": "kimi_k2", "_colibri_source_variant": "something_else",
+                "rope_scaling": {"type": "yarn", "beta_fast": 32.0, "beta_slow": 1.0},
+            }))
+            self.assertFalse(detect_k26(model))
+
+    def test_no_marker_falls_back_to_beta_fast(self):
+        """Regression guard: containers converted before the marker existed have no such
+        key and must keep working via the beta_fast fallback, unchanged."""
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "config.json").write_text(json.dumps({
+                "model_type": "kimi_k2",
+                "rope_scaling": {"type": "yarn", "beta_fast": 32.0, "beta_slow": 1.0},
+            }))
+            self.assertTrue(detect_k26(model))
 
 
 class StopFilterTest(unittest.TestCase):
@@ -636,6 +880,37 @@ class HTTPTest(unittest.TestCase):
         self.assertIsNotNone(queue_wait)
         self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
         self.assertEqual(self.engine.calls[-1][4], 1)
+
+    def test_chat_completion_dispatches_kimi_k2_renderer(self):
+        """The renderer-selection dict at chat_completion's `renderer = {...}.get(ARCH, ...)`
+        must route ARCH=="kimi_k2" to render_chat_k2, not fall through to GLM's template."""
+        with patch("openai_server.ARCH", "kimi_k2"):
+            with self.request("/v1/chat/completions", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 4,
+            }) as response:
+                json.load(response)
+        prompt = self.engine.calls[-1][0]
+        self.assertIn("<|im_user|>user<|im_middle|>Hi<|im_end|>"
+                      "<|im_assistant|>assistant<|im_middle|>", prompt)
+        self.assertNotIn("[gMASK]<sop>", prompt)
+        self.assertNotIn("<|user|>", prompt)
+
+    def test_chat_completion_dispatches_k26_renderer_via_is_k26_global(self):
+        """ARCH=="kimi_k2" alone is not enough to pick K2.6's rendering -- IS_K26 (set by
+        cmd_serve/main() from detect_k26) must also be threaded through, since
+        render_chat_k2 needs BOTH to know which of the two real templates to use."""
+        with patch("openai_server.ARCH", "kimi_k2"), patch("openai_server.IS_K26", True):
+            with self.request("/v1/chat/completions", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 4,
+            }) as response:
+                json.load(response)
+        prompt = self.engine.calls[-1][0]
+        self.assertEqual(prompt,
+            "<|im_user|>user<|im_middle|>Hi<|im_end|>"
+            "<|im_assistant|>assistant<|im_middle|><think></think>")
+        self.assertNotIn("You are Kimi", prompt)
 
     def test_chat_completion_stops_across_engine_chunks(self):
         before = self.engine.stop_requests
