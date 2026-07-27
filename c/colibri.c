@@ -96,6 +96,21 @@ typedef struct {
     char model_type[32];                          /* config.json "model_type", e.g. "kimi_k2".
                                                     * Selects the chat template at the prompt-building
                                                     * sites -- a plain string compare, no arch enum. */
+    /* ---- Kimi-K3 (model_type "kimi_linear"), spec in docs/K3-PORT.md ---- */
+    int act_situ;                 /* hidden_act "situ": beta*tanh(g/b)*sigmoid(g) * lb*tanh(u/lb) */
+    float situ_beta, situ_linear_beta;   /* activation_situ_beta / _linear_beta (4.0 / 25.0) */
+    int latent_moe;               /* routed_expert_hidden_size: routed experts run in this latent
+                                   * dim, bracketed by per-layer down/up projections (0 = classic,
+                                   * experts bracket `hidden` directly) */
+    int latent_norm;              /* latent_moe_use_norm: RMSNorm on the mixed latent before up_proj */
+    int mla_nope, mla_out_gate;   /* NoPE MLA (no rotary at all) + sigmoid(g_proj) output gate */
+    int res_block;                /* attn_res_block_size (0 = plain residual stream) */
+    int8_t kda[128];              /* per layer: 1 = KDA linear attention. Filled from the config's
+                                   * 1-INDEXED kda_layers list: layer i is KDA iff (i+1) is listed
+                                   * (configuration_kimi_k3.is_kda_layer -- easy to get wrong). */
+    int has_kda;                  /* any KDA layer present (linear_attn_config given) */
+    int kda_heads, kda_head_dim, kda_conv;   /* linear_attn_config: 96 / 128 / 4 for K3 */
+    float kda_lower_bound;        /* safe-gate bound (-5.0); 0 = plain -exp*softplus gate (unsupported) */
 } Cfg;
 
 /* tensore [O,I] in uno di tre formati:
@@ -169,6 +184,17 @@ typedef struct {
     int router_cuda_bad;                         /* upload failed once: stay on the CPU router */
 #endif
     QT sh_gate, sh_up, sh_down;                  /* shared expert */
+    /* ---- Kimi-K3 (kimi_linear), docs/K3-PORT.md ---- */
+    int is_kda;                                  /* this layer runs KDA linear attention, not MLA */
+    QT kda_q, kda_k, kda_v;                      /* [heads*head_dim, hidden] projections */
+    QT kda_fa, kda_fb, kda_b;                    /* low-rank gate f_a [hd,D] f_b [P,hd]; beta [heads,D] */
+    float *kda_qconv, *kda_kconv, *kda_vconv;    /* depthwise causal conv [P,1,conv] f32, SILU */
+    float *kda_alog, *kda_dtbias, *kda_onorm;    /* A_log (per-dim or per-head), dt_bias [P], o_norm [hd] */
+    QT attn_gate;                                /* g_proj output gate: KDA full-rank gate AND the
+                                                  * NoPE-MLA sigmoid output gate (both [P, hidden]) */
+    QT lat_down, lat_up; float *lat_norm;        /* latent MoE residents around the routed experts */
+    float *res_attn_norm, *res_attn_proj;        /* residual mixers (attn_res_block_size) */
+    float *res_mlp_norm, *res_mlp_proj;
 } Layer;
 
 /* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
@@ -766,6 +792,24 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
 
 #include "sample.h"
 #include "kv_persist.h"
+/* Routed-expert tensor naming, selected once at load from model_type. GLM/K2:
+ * model.layers.N.mlp.experts.M.{gate,up,down}_proj.weight. Kimi-K3 (kimi_linear):
+ * model.layers.N.block_sparse_moe.experts.M.{w1,w3,w2}.weight -- w1=gate, w3=up,
+ * w2=down (KimiBlockSparseMLP). One helper instead of the five snprintf sites
+ * this replaced (plus telemetry.h's probe, hence defined above that include),
+ * so a naming change can never de-sync the load paths. Buffers stay bounded:
+ * worst key is "model.layers.NNN.block_sparse_moe.experts.NNN.w1.weight"
+ * = 52 bytes incl NUL, under every caller's nm[288]/nm[300]. */
+static int g_moe_naming=0;   /* 0 = mlp.* (GLM/K2), 1 = block_sparse_moe.* (kimi_linear) */
+static const char *expert_suf(int k){   /* k: 0=gate 1=up 2=down */
+    static const char *glm[3]={"gate_proj","up_proj","down_proj"};
+    static const char *k3[3]={"w1","w3","w2"};
+    return g_moe_naming ? k3[k] : glm[k];
+}
+static const char *moe_prefix(void){ return g_moe_naming ? "block_sparse_moe" : "mlp"; }
+static void expert_weight_name(char *buf, size_t n, int layer, int eid, int k){
+    snprintf(buf,n,"model.layers.%d.%s.experts.%d.%s.weight",layer,moe_prefix(),eid,expert_suf(k));
+}
 #include "telemetry.h"
 
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -905,6 +949,19 @@ static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i
     float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++) x[i]/=s; }
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
+/* MLP gate/up activation, selected once at load from config hidden_act (GLM/K2:
+ * silu(g)*u; Kimi-K3 "situ": beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), betas
+ * 4.0/25.0 -- SituAndMul in modeling_kimi_linear, spec in docs/K3-PORT.md).
+ * Globals, not Cfg lookups: these run inside the hottest expert loops. */
+static int g_act_situ=0; static float g_situ_beta=1.f, g_situ_lb=0.f;   /* lb 0 = no up clip */
+static inline float act_gate(float g){
+    if(!g_act_situ) return siluf(g);
+    return g_situ_beta*tanhf(g/g_situ_beta)/(1.f+expf(-g));
+}
+static inline float act_up(float u){
+    if(!g_act_situ || g_situ_lb==0.f) return u;
+    return g_situ_lb*tanhf(u/g_situ_lb);
+}
 
 /* Rotary frequency table. Filled once by rope_table_init() from config.json and
  * read by rope_interleave instead of calling powf per position. With no
@@ -1073,7 +1130,16 @@ static void load_cfg(Cfg *c, const char *snap){
     c->qk_nope=gi(r,"qk_nope_head_dim"); c->qk_rope=gi(r,"qk_rope_head_dim");
     c->v_head=gi(r,"v_head_dim"); c->n_shared=gi(r,"n_shared_experts"); c->vocab=gi(r,"vocab_size");
     c->n_group=gi(r,"n_group"); c->topk_group=gi(r,"topk_group");
+    /* Kimi-K3 (kimi_linear) spells the DeepSeek-lineage MoE keys differently; each
+     * K3 name is read only when the classic key is absent, so GLM/K2 configs are
+     * byte-identical to before. num_expert_group/moe_renormalize map onto the
+     * existing n_group/norm_topk semantics (verified against KimiMoEGate). */
+    if(!c->n_experts) c->n_experts=gi(r,"num_experts");
+    if(!c->topk)      c->topk=gi(r,"num_experts_per_token");
+    if(!c->n_shared)  c->n_shared=gi(r,"num_shared_experts");
+    if(!c->n_group)   c->n_group=gi(r,"num_expert_group");
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
+    if(!nt){ jval *mr=json_get(r,"moe_renormalize"); c->norm_topk=(mr&&mr->t==J_BOOL)?mr->boolean:c->norm_topk; }
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
@@ -1083,6 +1149,50 @@ static void load_cfg(Cfg *c, const char *snap){
       if(mtv && mtv->str){ strncpy(c->model_type,mtv->str,sizeof(c->model_type)-1);
                             c->model_type[sizeof(c->model_type)-1]=0; }
       else c->model_type[0]=0; }
+    /* ---- Kimi-K3 (kimi_linear) extensions, all absent (=0) for GLM/K2 ---- */
+    c->act_situ=0; c->situ_beta=1.f; c->situ_linear_beta=0.f;
+    c->latent_moe=0; c->latent_norm=0; c->mla_nope=0; c->mla_out_gate=0;
+    c->res_block=0; c->has_kda=0; c->kda_heads=0; c->kda_head_dim=0; c->kda_conv=0;
+    c->kda_lower_bound=0.f; memset(c->kda,0,sizeof(c->kda));
+    { jval *ha=json_get(r,"hidden_act");
+      c->act_situ = (ha && ha->str && !strcmp(ha->str,"situ"));
+      if(c->act_situ){
+          jval *sb=json_get(r,"activation_situ_beta");
+          jval *lb=json_get(r,"activation_situ_linear_beta");
+          c->situ_beta = sb ? (float)sb->num : 1.f;
+          c->situ_linear_beta = lb ? (float)lb->num : 0.f;   /* 0 = no up-path clip */
+          if(c->situ_beta<=0){ fprintf(stderr,"config: activation_situ_beta must be > 0\n"); exit(1); }
+      } }
+    c->latent_moe=gi(r,"routed_expert_hidden_size");
+    { jval *ln=json_get(r,"latent_moe_use_norm"); c->latent_norm=(ln&&ln->t==J_BOOL)?ln->boolean:0; }
+    { jval *v=json_get(r,"mla_use_nope");        c->mla_nope=(v&&v->t==J_BOOL)?v->boolean:0; }
+    { jval *v=json_get(r,"mla_use_output_gate"); c->mla_out_gate=(v&&v->t==J_BOOL)?v->boolean:0; }
+    c->res_block=gi(r,"attn_res_block_size");
+    { jval *la=json_get(r,"linear_attn_config");
+      if(la && la->t==J_OBJ){
+          jval *kl=json_get(la,"kda_layers");
+          if(!kl || kl->t!=J_ARR || kl->len<=0){
+              fprintf(stderr,"config: linear_attn_config without a kda_layers list\n"); exit(1); }
+          /* The lists are 1-INDEXED (configuration_kimi_k3.is_kda_layer checks
+           * (layer_idx+1) -- porting this as 0-indexed silently swaps every
+           * layer's attention type). */
+          for(int i=0;i<kl->len;i++){
+              int li=(int)kl->kids[i]->num - 1;
+              if(li<0 || li>=c->n_layers || li>=128){
+                  fprintf(stderr,"config: kda_layers entry %d outside 1..%d\n",li+1,c->n_layers); exit(1); }
+              c->kda[li]=1; }
+          c->has_kda=1;
+          c->kda_heads=gi(la,"num_heads"); c->kda_head_dim=gi(la,"head_dim");
+          c->kda_conv=gi(la,"short_conv_kernel_size");
+          jval *lb=json_get(la,"gate_lower_bound");
+          c->kda_lower_bound = lb ? (float)lb->num : 0.f;
+          jval *fg=json_get(la,"use_full_rank_gate");
+          if(!(fg && fg->t==J_BOOL && fg->boolean)){
+              fprintf(stderr,"config: only use_full_rank_gate=true KDA is supported\n"); exit(1); }
+          if(c->kda_lower_bound>=0.f){
+              fprintf(stderr,"config: KDA needs a negative gate_lower_bound (safe gate); "
+                             "the plain -exp*softplus gate is not implemented\n"); exit(1); }
+      } }
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
@@ -1146,6 +1256,12 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
     CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
+    CKR("routed_expert_hidden_size",c->latent_moe,0,1<<20) CKR("attn_res_block_size",c->res_block,0,c->n_layers)
+    if(c->has_kda){
+        CKR("linear_attn num_heads",c->kda_heads,1,1024)
+        CKR("linear_attn head_dim",c->kda_head_dim,1,1<<12)
+        CKR("linear_attn short_conv_kernel_size",c->kda_conv,1,16)
+    }
     #undef CKR
     rope_table_init(c, r);                       /* needs c->theta and c->qk_rope */
     free(ar);
@@ -1438,6 +1554,11 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
+    /* Activation + naming selection are global (hottest loops read no Cfg): set
+     * BEFORE any tensor lookup or forward math. GPU fused-silu paths gate on
+     * !g_act_situ below. */
+    g_act_situ=m->c.act_situ; g_situ_beta=m->c.situ_beta; g_situ_lb=m->c.situ_linear_beta;
+    g_moe_naming = mt_is_kimi_linear(&m->c);
     { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: model shards spread across N drives */
       st_init_multi(&m->S,snap,(xd&&*xd)?xd:NULL); }
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
@@ -1464,6 +1585,26 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
+        l->is_kda = c->kda[i];
+        if(l->is_kda){
+            /* KDA linear attention (Kimi-K3): no MLA tensors exist on this layer --
+             * loading them would st_die_missing. P = heads*head_dim. */
+            int Pk=c->kda_heads*c->kda_head_dim;
+            l->kda_q = qt_load(m,P("self_attn.q_proj.weight"), Pk, D, dbits);
+            l->kda_k = qt_load(m,P("self_attn.k_proj.weight"), Pk, D, dbits);
+            l->kda_v = qt_load(m,P("self_attn.v_proj.weight"), Pk, D, dbits);
+            l->kda_qconv=ld(m,P("self_attn.q_conv1d.weight"));
+            l->kda_kconv=ld(m,P("self_attn.k_conv1d.weight"));
+            l->kda_vconv=ld(m,P("self_attn.v_conv1d.weight"));
+            l->kda_fa = qt_load(m,P("self_attn.f_a_proj.weight"), c->kda_head_dim, D, dbits);
+            l->kda_fb = qt_load(m,P("self_attn.f_b_proj.weight"), Pk, c->kda_head_dim, dbits);
+            l->kda_b  = qt_load(m,P("self_attn.b_proj.weight"), c->kda_heads, D, dbits);
+            l->kda_alog = ld(m,P("self_attn.A_log"));
+            l->kda_dtbias=ld(m,P("self_attn.dt_bias"));
+            l->kda_onorm =ld(m,P("self_attn.o_norm.weight"));
+            l->attn_gate = qt_load(m,P("self_attn.g_proj.weight"), Pk, D, dbits);
+            l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, Pk, dbits);
+        } else {
         l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
         l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
@@ -1471,6 +1612,15 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
         l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
         l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+        if(c->mla_out_gate)
+            l->attn_gate = qt_load(m,P("self_attn.g_proj.weight"), H*c->v_head, D, dbits);
+        }
+        if(c->res_block){
+            l->res_attn_norm=ld(m,P("self_attention_res_norm.weight"));
+            l->res_attn_proj=ld(m,P("self_attention_res_proj.weight"));
+            l->res_mlp_norm =ld(m,P("mlp_res_norm.weight"));
+            l->res_mlp_proj =ld(m,P("mlp_res_proj.weight"));
+        }
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
         qt_cuda_colocate(&l->q_a,&l->kv_b);   /* PIPE: intera catena attention sulla */
@@ -1485,12 +1635,21 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
         } else {
-            l->router=ld(m,P("mlp.gate.weight"));
-            l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
+            /* router/shared live under "mlp." (GLM/K2) or "block_sparse_moe." (K3) */
+            #define PN(s) (snprintf(nm,sizeof(nm),"model.layers.%d.%s." s,i,moe_prefix()),nm)
+            l->router=ld(m,PN("gate.weight"));
+            l->router_bias=ld(m,PN("gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
-            l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
-            l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
-            l->sh_down = qt_load(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
+            l->sh_gate = qt_load(m,PN("shared_experts.gate_proj.weight"), sI, D, dbits);
+            l->sh_up   = qt_load(m,PN("shared_experts.up_proj.weight"),   sI, D, dbits);
+            l->sh_down = qt_load(m,PN("shared_experts.down_proj.weight"), D, sI, dbits);
+            if(c->latent_moe){   /* K3: routed experts run in the latent dim, bracketed
+                                  * by these per-layer residents (docs/K3-PORT.md) */
+                l->lat_down = qt_load(m,PN("routed_expert_down_proj.weight"), c->latent_moe, D, dbits);
+                l->lat_up   = qt_load(m,PN("routed_expert_up_proj.weight"),   D, c->latent_moe, dbits);
+                if(c->latent_norm) l->lat_norm=ld(m,PN("routed_expert_norm.weight"));
+            }
+            #undef PN
 #ifdef COLI_CUDA
             qt_cuda_colocate(&l->sh_gate,&l->kv_b);  /* PIPE2: shared chain on the layer home device */
             qt_cuda_colocate(&l->sh_up,&l->sh_gate);
@@ -1794,11 +1953,9 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
-    /* suf as a bounded char[][16] (not const char*) lets GCC prove the %s in the
-     * nm[k]/qn snprintfs can't overflow: worst key is "model.layers.<i>.mlp.experts.<i>.down_proj.weight"
-     * = 66 bytes incl NUL, well under nm[288] and qn[320]. See #484. */
-    char nm[3][288]; const char suf[3][16]={"gate_proj","up_proj","down_proj"};
-    for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+    int De = c->latent_moe ? c->latent_moe : D;   /* K3: experts bracket the LATENT dim */
+    char nm[3][288];
+    for(int k=0;k<3;k++) expert_weight_name(nm[k],sizeof(nm[k]),layer,eid,k);
     char qn[320]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime.
                                                   * Reachable ONLY for unquantized models (no .qs);
@@ -1841,7 +1998,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                                              * costs a copy, not I/O (measure before
                                              * optimizing further). */
         if(okm){
-            QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+            QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,De}, II[3]={De,De,I};
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
@@ -2050,7 +2207,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         posix_fadvise(rep_bfd(&m->S,tw[ord[0]]->fd,rep), tw[ord[0]]->off, wtot, POSIX_FADV_DONTNEED);
         for(int k=0;k<3;k++) posix_fadvise(rep_bfd(&m->S,tq[k]->fd,rep), tq[k]->off, tq[k]->nbytes, POSIX_FADV_DONTNEED);
     }
-    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,De}, II[3]={De,De,I};
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
@@ -2130,8 +2287,8 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int li=b->nload++;
     UringLoad *l=&b->load[li]; memset(l,0,sizeof(*l));
     l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
-    char nm[3][288],qn[320]; const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
-    for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+    char nm[3][288],qn[320];
+    for(int k=0;k<3;k++) expert_weight_name(nm[k],sizeof(nm[k]),layer,eid,k);
     snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(g_mmap || !st_has(&m->S,qn))
         return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
@@ -2244,7 +2401,8 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         for(int k=0;k<3;k++) posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
     }
     Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden; float *fp[3]; int64_t fo=0;
-    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
+    int De=c->latent_moe?c->latent_moe:D;   /* K3: experts bracket the LATENT dim */
+    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,De},II[3]={De,De,I};
     int keep_raw=qscales_keep_raw(&l->qs);   /* QS_BF16: publish the bf16 scales as-is */
     if(!keep_raw) qscales_upcast(s->fslab,&l->qs);  /* reads complete; BF16 -> F32 before publishing */
     for(int k=0;k<3;k++){
@@ -2481,9 +2639,8 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
  * the .qs scales are always buffered, so keep theirs. Advisory hint -> output-preserving. */
 static void expert_prefetch(Model *m, int layer, int eid){
     char nm[300]; int rep=expert_route(layer,eid);
-    const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]);
+        expert_weight_name(nm,sizeof(nm),layer,eid,k);
         if(!g_direct) st_prefetch_rep(&m->S,nm,rep);
         char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch_rep(&m->S,qs,rep);
     }
@@ -3559,21 +3716,41 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         free(wsum); free(is_hit); free(keep);
     }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
-    float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
+    /* K3 latent MoE (docs/K3-PORT.md): routed experts read and write the LATENT dim
+     * (Dx = routed_expert_hidden_size), not `hidden`. xlat = lat_down(x) feeds the
+     * gathers; routed sums accumulate into rsum[Dx] and are RMS-normed + up-projected
+     * into `out` AFTER the loop (FASE D2 below). The router (FASE A, already done)
+     * and the shared expert (FASE E) stay on the hidden-dim x. Classic models keep
+     * Dx==D, xin==x, rout==out -- byte-identical behavior. */
+    int Dx = c->latent_moe ? c->latent_moe : D;
+    float *xlat=NULL, *rsum=NULL;
+    if(c->latent_moe){
+        xlat=falloc((int64_t)S*Dx); rsum=falloc((int64_t)S*Dx);
+        matmul_qt(xlat, x, &l->lat_down, S);
+        memset(rsum,0,(size_t)S*Dx*sizeof(float));
+    }
+    float *xin  = xlat ? xlat : x;
+    float *rout = rsum ? rsum : out;
+    /* hh must fit BOTH the expert rows (Dx wide) and FASE E's shared-expert
+     * output (D wide) -- it is reused across the two phases. */
+    int Dmax = Dx>D ? Dx : D;
+    float *xg=falloc((int64_t)S*Dx), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*Dmax);
     float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
                        * experts of the layer share it (the placement rule in quant.h) */
     /* Materialise xe on first use. Every site that feeds a routed expert's gate/up
      * input — CPU, the per-expert GPU call, and all three group packing paths —
      * must go through here: doing the transform per expert instead of per layer
      * costs ~11 ms against ~1.4 ms on GLM dims (#452). */
-    #define E8_XE(e) ((e)->g.fmt==6 ? (xe ? xe : (xe=falloc((int64_t)S*D), \
-        memcpy(xe,x,(size_t)S*D*sizeof(float)), e8_rot_rows(xe,S,D), xe)) : x)
+    #define E8_XE(e) ((e)->g.fmt==6 ? (xe ? xe : (xe=falloc((int64_t)S*Dx), \
+        memcpy(xe,xin,(size_t)S*Dx*sizeof(float)), e8_rot_rows(xe,S,Dx), xe)) : xin)
     int *rows=xalloc((size_t)S*sizeof(int),"moe rows"); float *rw=xalloc((size_t)S*sizeof(float),"moe rw");
 #ifdef COLI_CUDA
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
      * (misurato: 81s di expert-matmul tutto su CPU, GPU groups 21ms totali). */
-    int group_enabled = S<=64 || (g_cuda_pipe && S<=4096);
+    int group_enabled = (S<=64 || (g_cuda_pipe && S<=4096)) && !c->latent_moe;   /* GPU group
+        * buffers/kernels are hidden-dim; K3's latent experts stay on the CPU path
+        * (their fmt=7 tensors are never cuda_eligible anyway -- this is the belt) */
     float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
     int *group_row=group_enabled?xalloc((size_t)64*S*sizeof(int),"moe group_row"):NULL;
@@ -3830,7 +4007,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                             float *gj=GG+(int64_t)j*I, *uj=UU+(int64_t)j*I;
                             for(int o=c0;o<c1;o++) gj[o]=(float)dot_i4i8(qg+(int64_t)o*rbD,xq8,D)*e->g.s[o]*sx0;
                             for(int o=c0;o<c1;o++) uj[o]=(float)dot_i4i8(qu+(int64_t)o*rbD,xq8,D)*e->u.s[o]*sx0;
-                            for(int o=c0;o<c1;o++) gj[o]=siluf(gj[o])*uj[o];
+                            for(int o=c0;o<c1;o++) gj[o]=act_gate(gj[o])*act_up(uj[o]);
                         }                              /* implicit barrier */
                         #pragma omp for schedule(static)
                         for(int j=0;j<nb;j++) gsc[j]=qrow_i8(GG+(int64_t)j*I, GQ+(int64_t)j*I, I);
@@ -3882,7 +4059,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
 #endif
             const float *xsrc=E8_XE(e);
-            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, xsrc+(int64_t)rows[r]*D, D*sizeof(float));
+            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*Dx, xsrc+(int64_t)rows[r]*Dx, Dx*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
             if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
@@ -3895,11 +4072,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=act_gate(gg[z])*act_up(uu[z]);
             if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
             matmul_qt(hh, gg, &e->d, nr);
-            for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
-                for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+            for(int r=0;r<nr;r++){ float *os=rout+(int64_t)rows[r]*Dx, wgt=rw[r], *hr=hh+(int64_t)r*Dx;
+                for(int d=0;d<Dx;d++) os[d]+=wgt*hr[d]; }
             double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
                 m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
                 m->cpu_expert_rows+=(uint64_t)nr;}
@@ -3925,7 +4102,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)eg_row[gi][r]*D,D*sizeof(float));
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=act_gate(gg[z])*act_up(uu[z]);
                         matmul_qt(hh,gg,&e->d,nr);
                         for(int r=0;r<nr;r++){ float *os=out+(int64_t)eg_row[gi][r]*D; float wgt=eg_w[gi][r];
                             for(int d=0;d<D;d++) os[d]+=wgt*hh[(int64_t)r*D+d]; }
@@ -4026,7 +4203,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=act_gate(gg[z])*act_up(uu[z]);
                         if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input, as on the main CPU path */
                         matmul_qt(hh,gg,&e->d,nr);
                         if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
@@ -4055,6 +4232,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
+    /* ---- FASE D2 (K3 latent MoE only): rsum holds the weighted routed sum in the
+     * latent dim. RMS-norm it (latent_moe_use_norm), up-project into `out` -- whose
+     * rows FASE A zeroed and nothing else touched on the latent path -- and let
+     * FASE E add the shared expert on top, exactly the reference order
+     * (KimiSparseMoeBlock.forward: norm -> up_proj -> + shared). ---- */
+    if(c->latent_moe){
+        if(l->lat_norm){
+            for(int s=0;s<S;s++){ float *v=rsum+(int64_t)s*Dx; float ss=0;
+                for(int d=0;d<Dx;d++) ss+=v[d]*v[d];
+                float r=1.f/sqrtf(ss/(float)Dx + c->eps);
+                for(int d=0;d<Dx;d++) v[d]=v[d]*r*l->lat_norm[d]; }
+        }
+        matmul_qt(out, rsum, &l->lat_up, S);
+    }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
     if(!with_shared) goto shared_done;
     {
@@ -4068,6 +4259,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         atoi(getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")):32;
     if(shared_min<16)shared_min=16;
     if(shared_cuda==0&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
+       !g_act_situ&&   /* the fused GPU kernel bakes silu in; situ (K3) stays on the CPU path */
        l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
        getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))&&
        qt_cuda_upload(&l->sh_gate)&&qt_cuda_upload(&l->sh_up)&&qt_cuda_upload(&l->sh_down)){
@@ -4080,7 +4272,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         sg=falloc((int64_t)S*sI);su=falloc((int64_t)S*sI);
         matmul_qt(sg, x, &l->sh_gate, S);
         matmul_qt(su, x, &l->sh_up,   S);
-        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=siluf(sg[z])*su[z];
+        for(int64_t z=0;z<(int64_t)S*sI;z++) sg[z]=act_gate(sg[z])*act_up(su[z]);
         matmul_qt(hh, sg, &l->sh_down, S);
     }
     if(shared_cuda!=2) for(int64_t z=0;z<(int64_t)S*D;z++) out[z]+=hh[z];
@@ -4089,6 +4281,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
 shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
+    free(xlat); free(rsum);
     #undef E8_XE
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
@@ -4100,7 +4293,7 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     float *g=falloc((int64_t)S*I), *u=falloc((int64_t)S*I);
     matmul_qt(g, x, &l->gate_proj, S);
     matmul_qt(u, x, &l->up_proj,   S);
-    for(int64_t i=0;i<(int64_t)S*I;i++) g[i]=siluf(g[i])*u[i];
+    for(int64_t i=0;i<(int64_t)S*I;i++) g[i]=act_gate(g[i])*act_up(u[i]);
     matmul_qt(out, g, &l->down_proj, S);
     free(g); free(u);
 }
@@ -4136,7 +4329,7 @@ static void la_predict(Model *m, int target, const float *h, int kind){
         rmsnorm(snrm, h, sl->post_ln, D, c->eps);
         matmul_qt(sg, snrm, &sl->sh_gate, 1);
         matmul_qt(su, snrm, &sl->sh_up,   1);
-        for(int i=0;i<sI;i++) sg[i] = siluf(sg[i]) * su[i];
+        for(int i=0;i<sI;i++) sg[i] = act_gate(sg[i]) * act_up(su[i]);
         matmul_qt(sout, sg, &sl->sh_down, 1);
         for(int i=0;i<D;i++) hc[i] = h[i] + sout[i];
         rmsnorm(nrm, hc, l->post_ln, D, c->eps);
@@ -4431,7 +4624,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             rmsnorm(snrm, xs, sl->post_ln, D, c->eps);
             matmul_qt(sg, snrm, &sl->sh_gate, 1);
             matmul_qt(su, snrm, &sl->sh_up,   1);
-            for(int i=0;i<sI;i++) sg[i] = siluf(sg[i]) * su[i];
+            for(int i=0;i<sI;i++) sg[i] = act_gate(sg[i]) * act_up(su[i]);
             matmul_qt(sout, sg, &sl->sh_down, 1);
             for(int i=0;i<D;i++) hc[i] = xs[i] + sout[i];
             rmsnorm(nrm, hc, l->post_ln, D, c->eps);
@@ -6678,13 +6871,12 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
     if(!cnt||!first){ free(cnt); free(first); return; }
     for(int i=0;i<NR;i++) first[i]=-1;
     for(int a=from;a<to;a++){ if(first[r[a].l]<0) first[r[a].l]=a; cnt[r[a].l]++; }
-    const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int l=0;l<NR;l++){
         if(cnt[l]<2) continue;
         int64_t wtot=0; int ok=1; st_tensor *tqs[3]={NULL,NULL,NULL};
         for(int k=0;k<3 && ok;k++){
             char nm[288],qn[320];
-            snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.%s.weight",l,r[first[l]].e,suf[k]);
+            expert_weight_name(nm,sizeof nm,l,r[first[l]].e,k);
             snprintf(qn,sizeof qn,"%s.qs",nm);
             st_tensor *tw=st_find(&m->S,nm); tqs[k]=st_find(&m->S,qn);
             if(!tw||!tqs[k]) ok=0; else wtot+=tw->nbytes;
@@ -7298,6 +7490,11 @@ int main(int argc, char **argv){
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
+    if(g_act_situ && g_cuda_pipe){   /* the pipe's shared-expert kernel bakes silu in */
+        fprintf(stderr,"[CUDA] COLI_CUDA_PIPE disabled: this model uses the situ activation "
+                       "(no fused GPU kernel yet); shared experts stay on the CPU path\n");
+        g_cuda_pipe=0;
+    }
     g_cuda_router=getenv("COLI_CUDA_ROUTER")?atoi(getenv("COLI_CUDA_ROUTER")):0;
     g_cuda_resid=getenv("COLI_CUDA_RESID")?atoi(getenv("COLI_CUDA_RESID")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");

@@ -162,4 +162,11 @@ static int mt_is_k2(const Cfg *c){
     return c->model_type[0] && !strcmp(c->model_type, "kimi_k2");
 }
 
+/* Kimi-K3's text backbone: config model_type "kimi_linear" (the flattened
+ * text_config of the kimi_k3 multimodal container). Exact match, same contract
+ * as mt_is_k2 -- selects expert naming, chat template, and the K3 layer kinds. */
+static int mt_is_kimi_linear(const Cfg *c){
+    return c->model_type[0] && !strcmp(c->model_type, "kimi_linear");
+}
+
 #endif /* SAMPLE_H */

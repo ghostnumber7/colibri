@@ -12,14 +12,14 @@ static int64_t tbytes(int O,int I,int bits){
 
 static int64_t expert_bytes_probe(Model *m, int ebits){
     Cfg *c=&m->c; int64_t eb=0; char nm[256];
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.gate_proj.weight",c->first_dense);
+    expert_weight_name(nm,sizeof(nm),c->first_dense,0,0);
     if(st_nbytes(&m->S,nm)>0){
-        const char *suf[3]={"gate_proj","up_proj","down_proj"};
         for(int k=0;k<3;k++){
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",c->first_dense,suf[k]);
+            char qn[280];
+            expert_weight_name(nm,sizeof(nm),c->first_dense,0,k);
             eb+=st_nbytes(&m->S,nm);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",c->first_dense,suf[k]);
-            int64_t q=st_nbytes(&m->S,nm);
+            snprintf(qn,sizeof(qn),"%s.qs",nm);
+            int64_t q=st_nbytes(&m->S,qn);
             /* q is the sidecar's ON-DISK bytes, which for a BF16 .qs (Kimi-K2, 2B/scale)
              * is HALF the resident F32 bytes fslab actually holds after qscales_upcast --
              * undercounting eb here undercounts npin's per-expert cost (#229: this is the

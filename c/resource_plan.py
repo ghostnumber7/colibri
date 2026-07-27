@@ -12,7 +12,10 @@ from pathlib import Path
 
 
 GB = 1_000_000_000
-EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+# GLM/K2 name routed experts under mlp.experts; Kimi-K3 (kimi_linear) under
+# block_sparse_moe.experts -- one regex covers both (same helper split as the
+# engine's expert_weight_name in colibri.c).
+EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.(?:mlp|block_sparse_moe)\.experts\.(\d+)\.")
 
 
 def _tensor_sizes(path):
