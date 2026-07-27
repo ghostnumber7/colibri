@@ -6713,11 +6713,23 @@ static void run_serve_mux(Model *m, const char *snap){
  * checkpoint's own chat_template.jinja) has no session prefix and no default system
  * preamble. Both templates share the THINK convention: `tk` is <think> (thinking) or
  * <think></think> (nothink) after the assistant turn. */
-static int build_turn_prompt(char *buf, int bufsz, int is_k2, int templ, int first,
+/* fam: 0 = GLM, 1 = Kimi-K2 (im_ tokens), 2 = Kimi-K3 kimi_linear (XTML tags,
+ * encoding_k3.py: <|open|>message role="..."<|sep|>...<|close|>message<|sep|>
+ * <|end_of_msg|>; the generation prompt opens an assistant message plus a
+ * think/response block -- `tk` carries the opened block for K3, chosen by the
+ * caller's THINK env exactly like the other families' think markers). */
+static int build_turn_prompt(char *buf, int bufsz, int fam, int templ, int first,
                               const char *input, const char *tk){
     if(!templ) return snprintf(buf,bufsz,"%s",input);
     int bl=0;
-    if(is_k2){
+    if(fam==2){
+        bl+=snprintf(buf+bl,bufsz-bl,
+            "<|open|>message role=\"user\"<|sep|>%s<|close|>message<|sep|><|end_of_msg|>"
+            "<|open|>message role=\"assistant\"<|sep|>%s",
+            input,tk);
+        return bl;
+    }
+    if(fam==1){
         bl+=snprintf(buf+bl,bufsz-bl,
             "<|im_user|>user<|im_middle|>%s<|im_end|><|im_assistant|>assistant<|im_middle|>%s",
             input,tk);
@@ -6825,8 +6837,13 @@ static void run_serve(Model *m, const char *snap){
          * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
          * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita.
          * (Kimi-K2.6 usa la stessa convenzione THINK, vedi build_turn_prompt.) */
-        const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
-        int is_k2 = mt_is_k2(&m->c);
+        int think_on = getenv("THINK")&&atoi(getenv("THINK"));
+        int fam = mt_is_kimi_linear(&m->c) ? 2 : mt_is_k2(&m->c) ? 1 : 0;
+        /* K3's XTML template opens a think/response BLOCK instead of GLM/K2's
+         * <think> marker pair -- same THINK env, per-family spelling. */
+        const char *tk = fam==2 ? (think_on ? "<|open|>think<|sep|>" : "<|open|>response<|sep|>")
+                                 : (think_on ? "<think>" : "<think></think>");
+        int is_k2 = fam;
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);

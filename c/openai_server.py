@@ -641,6 +641,47 @@ def render_chat_k2(messages, enable_thinking=False, reasoning_effort=None, tools
     return "".join(prompt)
 
 
+def render_chat_k3(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                   tool_choice=None):
+    """Render Kimi-K3's XTML chat format (encoding_k3.py in the source checkpoint --
+    the container ships no jinja file): tagged messages
+    <|open|>message role="..."<|sep|>TEXT<|close|>message<|sep|><|end_of_msg|>, and a
+    generation prompt that opens an assistant message plus a think/response block.
+    History assistant turns are rendered as plain response blocks (reasoning from
+    earlier turns is never replayed, same policy as every other renderer here). A pure
+    renderer, testable without a model directory on disk.
+
+    Tool calling uses XTML tool-declare/tool-call tags not wired up yet -- same scope
+    decision as render_chat_inkling/render_chat_k2."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or (tool_choice not in (None, "none")):
+        raise APIError(400, "Tool use is not wired up for the Kimi-K3 engine yet.",
+                       "tools", "unsupported_parameter")
+    prompt = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            prompt.append(f'<|open|>message role="system"<|sep|>{text}'
+                          f'<|close|>message<|sep|><|end_of_msg|>')
+        elif role == "user":
+            prompt.append(f'<|open|>message role="user"<|sep|>{text}'
+                          f'<|close|>message<|sep|><|end_of_msg|>')
+        elif role == "assistant":
+            prompt.append(f'<|open|>message role="assistant"<|sep|><|open|>response<|sep|>{text}'
+                          f'<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>')
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    blk = "think" if enable_thinking else "response"
+    prompt.append(f'<|open|>message role="assistant"<|sep|><|open|>{blk}<|sep|>')
+    return "".join(prompt)
+
+
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
 # A translation layer, NOT a second engine path: /v1/messages rewrites an Anthropic-shaped
 # request into the exact OpenAI-shaped body the existing path already validates, so prompt
@@ -1990,7 +2031,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = {"inkling": render_chat_inkling, "kimi_k2": render_chat_k2}.get(ARCH, render_chat)
+        renderer = {"inkling": render_chat_inkling, "kimi_k2": render_chat_k2,
+                    "kimi_k3": render_chat_k3}.get(ARCH, render_chat)
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
                           tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
@@ -2027,7 +2069,8 @@ class APIHandler(BaseHTTPRequestHandler):
             tools = None
         # Same renderer-selection dict as chat_completion's (:1840 as of this writing) --
         # without it every non-GLM arch (including K2) gets GLM's [gMASK]<sop> template here.
-        renderer = {"inkling": render_chat_inkling, "kimi_k2": render_chat_k2}.get(ARCH, render_chat)
+        renderer = {"inkling": render_chat_inkling, "kimi_k2": render_chat_k2,
+                    "kimi_k3": render_chat_k3}.get(ARCH, render_chat)
         prompt = renderer(messages, enable_thinking, "high" if enable_thinking else None,
                           tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
@@ -2318,6 +2361,8 @@ def detect_arch(model_dir):
         return "inkling"
     if model_type == "kimi_k2":
         return "kimi_k2"
+    if model_type == "kimi_linear":     # Kimi-K3's text backbone (flattened text_config)
+        return "kimi_k3"
     return "glm"
 
 
@@ -2325,7 +2370,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi_k2"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi_k2", "kimi_k3"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2351,7 +2396,8 @@ def main():
         ARCH = detect_arch(args.model)
     if args.model_id is None:
         args.model_id = {"inkling": "inkling-colibri",
-                         "kimi_k2": "kimi-k2-colibri"}.get(ARCH, "glm-5.2-colibri")
+                         "kimi_k2": "kimi-k2-colibri",
+                    "kimi_k3": "kimi-k3-colibri"}.get(ARCH, "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,

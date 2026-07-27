@@ -140,6 +140,7 @@ def banner(sub="", model_type=None):
     # GLM-specific and would be wrong for any other model, so they don't carry over.
     sp=sprite_lines()
     ident = "Kimi-K2 · MoE · int4/int8 · streaming CPU" if model_type=="kimi_k2" \
+            else "Kimi-K3 · hybrid KDA MoE · mxfp4/int8 · streaming CPU" if model_type=="kimi_linear" \
             else "GLM-5.2 · 744B MoE · int4 · streaming CPU"
     txt=[
         f"{C.teal}{C.b}colibri{C.r} {C.dim}v{_version}{C.r}",
@@ -594,6 +595,13 @@ def build_run_prompt(mt, prompt):
     Kept as a pure function (no env lookups beyond THINK, no subprocess) so it is
     testable without an engine binary or a real tokenizer.json -- see test_cli_output.py."""
     tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
+    if mt=="kimi_linear":
+        # Kimi-K3 XTML template (encoding_k3.py in the checkpoint repo): tagged
+        # messages closed by <|end_of_msg|>; the generation prompt opens an
+        # assistant message plus a think/response block (THINK env picks which).
+        blk="<|open|>think<|sep|>" if os.environ.get("THINK","0")=="1" else "<|open|>response<|sep|>"
+        return (f'<|open|>message role="user"<|sep|>{prompt}<|close|>message<|sep|>'
+                f'<|end_of_msg|><|open|>message role="assistant"<|sep|>{blk}')
     if mt=="kimi_k2":
         # Kimi-K2.6 template, pinned from the checkpoint's own chat_template.jinja
         # rendered through transformers' Jinja2 env: no [gMASK]/<sop>, no default
