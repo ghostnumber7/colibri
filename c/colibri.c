@@ -112,7 +112,13 @@ typedef struct {
  * fmt=5 (int3, per-GROUP scales, group=64, see quant.h I3_*): values in [-4,3] stored per
  * 64-input group as 24 bytes = 16B low plane (2 bits/val, int2 layout) + 8B high plane
  * (1 bit/val), plus ONE f32 scale PER GROUP (s has O*ceil(I/64) entries, not O). 3.5
- * bits/weight effective — the quality/size sweet spot measured in the #132 ablation. */
+ * bits/weight effective — the quality/size sweet spot measured in the #132 ablation.
+ * fmt=7 (mxfp4, Kimi-K3 experts): e2m1 nibbles in q4 (same packing as fmt=2/4) +
+ * ONE U8 e8m0 scale per group of 32 inputs, both VERBATIM from the source
+ * checkpoint (lossless passthrough, transcode_mxfp4). `s` points at the U8 e8m0
+ * bytes (O*ceil(I/32) of them, 1B each) — NOT floats; only matmul_mxfp4 reads it.
+ * The .qs dtype U8 is the on-disk discriminator: the nibble byte count is
+ * identical to fmt=2/4, so byte counts alone must never route this format. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
     /* QS_BF16: `s` points at bf16 scales (2B each), NOT f32 -- read only via qs_at().
@@ -138,6 +144,9 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*ng*24 + (int64_t)t->O*ng*4; }
     if(t->fmt==6)  /* E8/IQ3: 98B per 256 weights, scales in-block, .qs is a 4-byte tag */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
+    if(t->fmt==7)  /* mxfp4: packed nibbles + one U8 e8m0 scale per 32-input group
+                    * (MXFP4_GS in quant.h, included below — keep the 32 literal here) */
+        return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*((t->I+31)/32);
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
@@ -319,6 +328,7 @@ static void qt_cuda_reset(QT *t){
 static int g_cuda_e8_ready;   /* codebook published to the devices (see cuda_boot) */
 static int qt_cuda_upload(QT *t){
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
+    if(t->fmt==7) return 0;   /* mxfp4 (K3): no CUDA kernel yet — tensor stays CPU-side */
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
@@ -613,7 +623,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && !omp_in_parallel()){
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=7 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
@@ -625,6 +635,9 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs,w->s_bf16); return; }
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
+    if(w->fmt==7){ matmul_mxfp4(y,x,w->q4,(const uint8_t*)w->s,S,w->I,w->O); return; }  /* K3
+        * experts: MUST dispatch above the fmt=2 fall-through -- the nibble bytes are
+        * identical and matmul_i4 would decode them as offset-binary int4 in silence. */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
@@ -1167,10 +1180,24 @@ static int detect_group_size(int O, int I, int64_t ns){
  * diventava un int2 valido e il matmul leggeva oltre il buffer (O*I nibble a
  * 4/byte). Qui i byte del peso devono corrispondere a un layout noto e i byte
  * della scala alla cardinalita' attesa (O per-row, O*ng per-gruppo) — altrimenti
- * si termina invece di sforare. Ritorna fmt (1/2/3/4/5) e scrive *gs. */
-static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int *gs){
+ * si termina invece di sforare. Ritorna fmt (1/2/3/4/5/7) e scrive *gs.
+ * `sdt` is the .qs sidecar's dtype code (0=BF16 1=F16 2=F32 3=U8): mxfp4 (fmt=7)
+ * has nibble bytes IDENTICAL to int4, so only the U8 scale dtype can route it —
+ * byte counts must never decide, or an mxfp4 tensor mis-decodes as int4 in
+ * silence (fluent garbage). `ns` stays in F32-equivalent bytes (count*4). */
+static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns, int sdt, int *gs){
     int64_t exp_i8=(int64_t)O*I, exp_i4=(int64_t)O*((I+1)/2), exp_i2=(int64_t)O*((I+3)/4);
     int64_t exp_i3=(int64_t)O*i3_rowbytes(I);   /* int3-g64 (fmt=5): 24B per 64-input group */
+    if(sdt==3){   /* U8 .qs = mxfp4 e8m0 sidecar, the fmt=7 discriminator. An
+                   * unexpected byte count under a U8 sidecar is always a refusal:
+                   * no other format stores U8 scales, so falling through to the
+                   * count-based inference below could only ever mis-route. */
+        int64_t ngm=((int64_t)I+MXFP4_GS-1)/MXFP4_GS;
+        if(nb==exp_i4 && ns==(int64_t)O*ngm*4){ *gs=MXFP4_GS; return 7; }
+        fprintf(stderr,"%s: U8 .qs sidecar but weight/scale bytes (%lld/%lld) do not match "
+                "mxfp4 [%d,%d] (want %lld/%lld), refusing (untrusted container)\n",
+                name,(long long)nb,(long long)(ns/4),O,I,
+                (long long)exp_i4,(long long)(O*ngm)); exit(1); }
     /* fmt=6 (E8/IQ3, #452): scales live inside the 98B super-blocks, so the .qs
      * convention is kept with a single-float tag — ns==4 is the discriminator
      * (every other format carries at least O floats of real scales). */
@@ -1234,10 +1261,10 @@ typedef struct {
 static int qscales_plan(shards *S, st_tensor *tq[3], QScales *q){
     (void)S;
     memset(q,0,sizeof *q);
-    int dt0 = tq[0]->dtype;                                   /* 0=BF16 1=F16 2=F32 */
-    if(dt0!=0 && dt0!=1 && dt0!=2) return -1;                 /* unrecognized dtype: refuse */
+    int dt0 = tq[0]->dtype;                                   /* 0=BF16 1=F16 2=F32 3=U8 */
+    if(dt0!=0 && dt0!=1 && dt0!=2 && dt0!=3) return -1;       /* unrecognized dtype: refuse */
     q->dt = dt0;
-    q->sbytes = (dt0==2) ? 4 : 2;
+    q->sbytes = (dt0==2) ? 4 : (dt0==3) ? 1 : 2;              /* U8 = mxfp4 e8m0, 1B/scale */
     for(int k=0;k<3;k++){
         if(tq[k]->dtype != dt0) return -1;                    /* mixed dtypes across the 3 tensors: refuse */
         if(tq[k]->nbytes<=0 || (tq[k]->nbytes % q->sbytes)) return -1;
@@ -1252,7 +1279,10 @@ static int qscales_plan(shards *S, st_tensor *tq[3], QScales *q){
      * unreachable scale count for any real container -- this is a wrap guard, not a
      * realistic ceiling. */
     if(q->NS<=0 || q->NS > (int64_t)((SIZE_MAX-QSCALES_PAD)/4)) return -1;
-    q->raw_off = (q->sbytes==4) ? 0 : q->NS*2 + QSCALES_PAD;
+    /* U8 (mxfp4 e8m0) scales are NEVER upcast -- the kernel reads them raw -- so
+     * they land directly at the fslab base (raw_off=0, like F32's "already final"
+     * case) instead of in the bf16 upper landing zone. */
+    q->raw_off = (q->sbytes==4 || q->dt==3) ? 0 : q->NS*2 + QSCALES_PAD;
     return 0;
 }
 /* bytes fslab must hold: NS floats, plus a fixed QSCALES_PAD. The pad is
@@ -1273,7 +1303,7 @@ static size_t qscales_alloc_bytes(const QScales *q){
 static char *qscales_raw(float *fslab, const QScales *q, int k){
     int64_t before=0; for(int i=0;i<k;i++) before += q->nsc[i];
     if(q->sbytes==4) return (char*)(fslab + before);
-    return (char*)fslab + q->raw_off + before*2;
+    return (char*)fslab + q->raw_off + before*q->sbytes;   /* 2 (bf16/f16) or 1 (u8 e8m0) */
 }
 /* in place, no-op when sbytes==4 (GLM: byte-identical to before this change).
  * Converter is picked by q->dt: BF16 (Kimi-K2) and F16 are both 2 bytes/scale
@@ -1292,10 +1322,13 @@ static char *qscales_raw(float *fslab, const QScales *q, int k){
  * uses. */
 static int g_qs_bf16 = 0;
 static inline int qscales_keep_raw(const QScales *q){
+    /* U8 (mxfp4 e8m0) is unconditionally raw: there is no f32 form of an e8m0
+     * exponent byte the kernel wants -- matmul_mxfp4 decodes 2^(u8-127) itself. */
+    if(q->dt==3) return 1;
     return g_qs_bf16 && q->sbytes==2 && q->dt==0;
 }
 static void qscales_upcast(float *fslab, const QScales *q){
-    if(q->sbytes==4) return;
+    if(q->sbytes==4 || q->dt==3) return;   /* F32: already final; U8 e8m0: stays raw */
     const uint16_t *raw = (const uint16_t*)((char*)fslab + q->raw_off);
     if(q->dt==1) for(int64_t i=0;i<q->NS;i++) fslab[i] = f16_to_f32(raw[i]);
     else         for(int64_t i=0;i<q->NS;i++) fslab[i] = bf16_to_f32(raw[i]);
@@ -1316,18 +1349,25 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
          * float by dtype (see st_read_f32 in st.h), so only the byte-count fed to
          * qt_resolve_fmt needs fixing. F32 sidecars get sbytes=4 -> ns4==ns, so the
          * GLM path (f32 .qs) is byte-identical to before. */
-        int sdt = st_dtype(&m->S,sn);                 /* 0=BF16 1=F16 2=F32 */
-        int sbytes = (sdt == 2) ? 4 : 2;               /* F32=4B, BF16/F16=2B per scale */
+        int sdt = st_dtype(&m->S,sn);                 /* 0=BF16 1=F16 2=F32 3=U8 */
+        int sbytes = (sdt == 2) ? 4 : (sdt == 3) ? 1 : 2;  /* F32=4B, U8=1B, BF16/F16=2B per scale */
         int64_t ns4 = ns * 4 / sbytes;                 /* normalized to F32-equivalent bytes */
         /* fmt=4 int4-grouped: byte int4 ma scala > O*4 — gs deriva dalla scala.
          * qt_resolve_fmt valida entrambi i conteggi contro [O,I] e termina se
          * non fidati (SEC). */
         int gs=0;
-        int fmt = qt_resolve_fmt(name,O,I,nb,ns4,&gs);
+        int fmt = qt_resolve_fmt(name,O,I,nb,ns4,sdt,&gs);
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
             st_read_raw(&m->S,name,t->q4,drop); }
+        else if(fmt==7){ int64_t ng=((int64_t)I+gs-1)/gs;   /* mxfp4: U8 e8m0 scales stay RAW in
+                          * `s` (1B each, read only by matmul_mxfp4) — st_read_f32_cap below must
+                          * not touch them, so this arm reads BOTH tensors and returns early. */
+            if(t->fmt!=7||!t->q4){ t->fmt=7; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=qalloc((size_t)O*ng); }
+            st_read_raw(&m->S,name,t->q4,drop);
+            st_read_raw(&m->S,sn,t->s,drop);
+            return; }
         else if(fmt==5){ int64_t ng=i3_groups(I);   /* int3-g64: 24B/group weights + O*ng group scales */
             if(t->fmt!=5||!t->q4){ t->fmt=5; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
             st_read_raw(&m->S,name,t->q4,drop); }
@@ -1592,6 +1632,8 @@ static void embed_row(Model *m, int tok, float *x){
             for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                 x[base+k]=(float)((int)u-4)*sr[g]; } }
         return; }
+    if(e->fmt==7){ fprintf(stderr,"embed_row: fmt=7 (mxfp4) embed/lm_head is not a layout any "
+        "converter emits (K3 keeps io tensors int8) — refusing the int2 fall-through\n"); exit(1); }
     const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];   /* int2 */
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
 }
@@ -1803,7 +1845,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
             for(int k=0;k<3;k++){
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
-                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,mqs.nsc[k]*4,&gs);   /* F32-equivalent */
+                int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,mqs.nsc[k]*4,mqs.dt,&gs);   /* F32-equivalent */
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -2012,10 +2054,12 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     for(int k=0;k<3;k++){
         int64_t nb=tw[k]->nbytes;
         int gs=0;
-        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,qs.nsc[k]*4,&gs);   /* F32-equivalent */
+        int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,qs.nsc[k]*4,qs.dt,&gs);   /* F32-equivalent */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
-        qt[k]->s_bf16=qscales_keep_raw(&qs);
+        /* s_bf16 means "qs_at reads bf16" -- an mxfp4 (fmt=7) sidecar is raw U8 read
+         * only by matmul_mxfp4, never through qs_at, so the flag must stay 0. */
+        qt[k]->s_bf16=(fmt==7)?0:qscales_keep_raw(&qs);
     }
     s->eid=eid; return 0;
 }
@@ -2209,10 +2253,10 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         /* qt_resolve_fmt like the other two expert paths: the raw ?1:?2:3 inference here
          * missed grouped int4 (fmt=4, gs never set) and would mis-tag int3-g64 as int2. */
         int gs=0;
-        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->qs.nsc[k]*4,&gs);   /* F32-equivalent */
+        int fmt=qt_resolve_fmt(l->tw[k]->name,OO[k],II[k],nb,l->qs.nsc[k]*4,l->qs.dt,&gs);   /* F32-equivalent */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
-        qt[k]->s_bf16=keep_raw;
+        qt[k]->s_bf16=(fmt==7)?0:keep_raw;   /* U8 e8m0 is raw but NOT bf16-for-qs_at */
     }
     if(publish_eid) s->eid=l->eid;
     l->finalized=1; return 0;
@@ -2449,6 +2493,8 @@ static void expert_prefetch(Model *m, int layer, int eid){
 /* acc[0..I) += coef * W[row,:] (dequant al volo) */
 static void qt_addrow(const QT *t, int row, float coef, float *acc){
     int I=t->I;
+    if(t->fmt==7){ fprintf(stderr,"qt_addrow: fmt=7 (mxfp4) never reaches the absorb path "
+        "(K3 experts are streaming-only, kv_b is int8) — refusing the fall-through\n"); exit(1); }
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
     /* fmt=4 PRIMA del calcolo di c: s[] e' [O,ng] per-gruppo, s[row] sarebbe la scala
      * sbagliata. Senza questo ramo il fall-through int2 decodificava i nibble int4 come
@@ -2484,6 +2530,8 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
 /* y[0..n) = W[r0+j,:]·x  (matvec su una FETTA di righe del QT) */
 static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y){
     int I=t->I;
+    if(t->fmt==7){ fprintf(stderr,"qt_matvec_rows: fmt=7 (mxfp4) never reaches the absorb path "
+        "— refusing the fall-through\n"); exit(1); }
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
         else if(t->fmt==4){ /* grouped int4: per-group scale */

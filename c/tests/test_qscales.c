@@ -64,12 +64,12 @@ int main(void){
 
         /* Wrong (what the streaming path did): raw bytes fed to qt_resolve_fmt */
         int gs_wrong=0;
-        CHECK(qt_resolve_fmt("gate", O, I, nb, ns_bf16, &gs_wrong) == 4);
+        CHECK(qt_resolve_fmt("gate", O, I, nb, ns_bf16, 0, &gs_wrong) == 4);
         CHECK(gs_wrong == 64);                          /* the silent bug, pinned */
 
         /* Right: F32-equivalent byte count */
         int gs_right=0;
-        CHECK(qt_resolve_fmt("gate", O, I, nb, nscales*4, &gs_right) == 4);
+        CHECK(qt_resolve_fmt("gate", O, I, nb, nscales*4, 0, &gs_right) == 4);
         CHECK(gs_right == GS);
     }
 
@@ -224,9 +224,16 @@ int main(void){
         st_tensor *zero[3] = { &zero_[0], &zero_[1], &zero_[2] };
         CHECK(qscales_plan(NULL, zero, &q) == -1);
 
-        /* unrecognized dtype (3 = U8, a real code in this codebase, just not a
-         * valid .qs dtype): refuse, not a silent fallback to some default. */
-        st_tensor bad_[3] = { mk_tensor(3,64), mk_tensor(3,64), mk_tensor(3,64) };
+        /* U8 (dtype 3) is a VALID .qs dtype since fmt=7: it is the mxfp4 e8m0
+         * sidecar discriminator (Kimi-K3 experts), accepted at 1 byte/scale and
+         * kept raw (full geometry pinned in tests/test_mxfp4_kernel.c). This
+         * assertion used to pin the pre-K3 refusal -- the contract changed. */
+        st_tensor u8_[3] = { mk_tensor(3,64), mk_tensor(3,64), mk_tensor(3,64) };
+        st_tensor *u8[3] = { &u8_[0], &u8_[1], &u8_[2] };
+        CHECK(qscales_plan(NULL, u8, &q) == 0);
+        CHECK(q.sbytes == 1 && q.dt == 3 && q.raw_off == 0);
+        /* a GENUINELY unrecognized dtype code still refuses */
+        st_tensor bad_[3] = { mk_tensor(9,64), mk_tensor(9,64), mk_tensor(9,64) };
         st_tensor *bad[3] = { &bad_[0], &bad_[1], &bad_[2] };
         CHECK(qscales_plan(NULL, bad, &q) == -1);
 

@@ -110,13 +110,13 @@ int main(void){
          *    per-row vs grouped is not distinguishable from byte counts alone. */
         if(I>256){ int gs=-1;
           int64_t ns_g64=(int64_t)O*i3_groups(I)*4, ns_row=(int64_t)O*4;
-          CHECK(qt_resolve_fmt("t.i3", O, I, (int64_t)O*i3_rowbytes(I), ns_g64, &gs)==5);
+          CHECK(qt_resolve_fmt("t.i3", O, I, (int64_t)O*i3_rowbytes(I), ns_g64, 2, &gs)==5);
           CHECK(gs==0);
-          CHECK(qt_resolve_fmt("t.i8", O, I, (int64_t)O*I, ns_row, &gs)==1);
-          CHECK(qt_resolve_fmt("t.i4", O, I, (int64_t)O*((I+1)/2), ns_row, &gs)==2);
-          CHECK(qt_resolve_fmt("t.i4g", O, I, (int64_t)O*((I+1)/2), ns_g64, &gs)==4);
+          CHECK(qt_resolve_fmt("t.i8", O, I, (int64_t)O*I, ns_row, 2, &gs)==1);
+          CHECK(qt_resolve_fmt("t.i4", O, I, (int64_t)O*((I+1)/2), ns_row, 2, &gs)==2);
+          CHECK(qt_resolve_fmt("t.i4g", O, I, (int64_t)O*((I+1)/2), ns_g64, 2, &gs)==4);
           CHECK(gs==64);
-          CHECK(qt_resolve_fmt("t.i2", O, I, (int64_t)O*((I+3)/4), ns_row, &gs)==3); }
+          CHECK(qt_resolve_fmt("t.i2", O, I, (int64_t)O*((I+3)/4), ns_row, 2, &gs)==3); }
         free(t.q4); free(t.s);
     }
 

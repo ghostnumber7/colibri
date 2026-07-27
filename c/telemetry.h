@@ -25,7 +25,10 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
              * undercounting eb here undercounts npin's per-expert cost (#229: this is the
              * exact RAM-ceiling-OOM failure mode, just from the other direction: previously
              * an unrelated 2x under-ALLOCATION, here a 2x under-COUNT that over-PINS). */
-            if(q>0) eb += (st_dtype(&m->S,nm)==2 ? q : q*2);
+            /* U8 (dtype 3, mxfp4 e8m0) stays RAW in RAM (qscales_keep_raw) -- resident
+             * bytes == on-disk bytes, no widening. Only BF16/F16 sidecars double. */
+            int sdt=st_dtype(&m->S,nm);
+            if(q>0) eb += (sdt==2 || sdt==3) ? q : q*2;
         }
     }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);

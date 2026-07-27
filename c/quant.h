@@ -213,6 +213,66 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
     }
 }
 
+/* ---- y[S,O] = x[S,I] @ W^T, W mxfp4 (fmt=7): e2m1 nibbles + u8 e8m0 group-32
+ * scales, both VERBATIM from the compressed-tensors source (Kimi-K3 experts,
+ * transcode_mxfp4 in tools/convert_fp8_to_int4.py). Decode contract, pinned by
+ * test_transcode_mxfp4_is_raw_passthrough and cross-checked bit-exact against
+ * compressed-tensors 0.17.1 on a real K3 shard tensor:
+ *   w[o,i] = E2M1[nibble(o,i)] * 2^(qs[o, i/32] - 127)
+ * LOW nibble = even element, same packing as fmt=2/4 -- ONLY the .qs dtype (U8)
+ * distinguishes the formats on disk, so the loader must never let byte counts
+ * alone route an mxfp4 tensor into the int4 kernels (fluent garbage). */
+static const float MXFP4_E2M1[16] = {0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
+                                     -0.f,-0.5f,-1.f,-1.5f,-2.f,-3.f,-4.f,-6.f};
+static inline float mx_e8m0(uint8_t e){ return ldexpf(1.0f, (int)e - 127); }
+#define MXFP4_GS 32
+
+static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint8_t *qs,
+                         int S, int I, int O){
+    const int gs=MXFP4_GS; int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const uint8_t *sr=qs+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+                float sc=mx_e8m0(sr[g]); float ga=0; int i=base;
+#ifdef __AVX2__
+                /* 8-entry magnitude LUT via permutevar (code&7), sign from bit3
+                 * XORed onto the float sign bit (8<<28 == 0x80000000). */
+                const __m128i m4=_mm_set1_epi8(0x0F);
+                const __m256i m7=_mm256_set1_epi32(7), m8=_mm256_set1_epi32(8);
+                const __m256 lut=_mm256_setr_ps(0.f,0.5f,1.f,1.5f,2.f,3.f,4.f,6.f);
+                __m256 acc=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){
+                    __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    __m256i c0=_mm256_cvtepu8_epi32(nib);
+                    __m256i c1=_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8));
+                    __m256 w0=_mm256_permutevar8x32_ps(lut,_mm256_and_si256(c0,m7));
+                    __m256 w1=_mm256_permutevar8x32_ps(lut,_mm256_and_si256(c1,m7));
+                    w0=_mm256_castsi256_ps(_mm256_xor_si256(_mm256_castps_si256(w0),
+                        _mm256_slli_epi32(_mm256_and_si256(c0,m8),28)));
+                    w1=_mm256_castsi256_ps(_mm256_xor_si256(_mm256_castps_si256(w1),
+                        _mm256_slli_epi32(_mm256_and_si256(c1,m8),28)));
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+                ga+=hsum256(acc);
+#endif
+                for(; i<base+glen; i++){
+                    uint8_t byte=w[i>>1];
+                    ga += xs[i]*MXFP4_E2M1[(i&1) ? (byte>>4)&0xF : byte&0xF];
+                }
+                a+=ga*sc;
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+
 /* ---- fused gate+up: one OMP dispatch for both matrices -------------------- */
 static void matmul_i4_pair(float *yg, float *yu, const float *x,
                            const uint8_t *qg, const float *sg,
