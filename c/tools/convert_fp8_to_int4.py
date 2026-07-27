@@ -249,11 +249,13 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
                                     "enorm", "hnorm", "shared_head"]): return "skip"
     if name.endswith("rotary_emb.inv_freq"): return "skip"   # K2 per-layer RoPE buffer; engine derives from theta
     if name.endswith("e_score_correction_bias"): return "f32"
-    if name.endswith("mlp.gate.weight"): return "f32"    # router (NON gate_proj)
+    # router (NON gate_proj): GLM/K2 name it mlp.gate, K3 block_sparse_moe.gate
+    if name.endswith(("mlp.gate.weight", "block_sparse_moe.gate.weight")): return "f32"
     if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
     if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
     if ".mlp.experts." in name and name.endswith(".weight"): return "x"          # expert ROUTED (streaming)
     if ".mlp.experts." in name and name.endswith(".weight_packed"): return "x"    # K2 compressed-tensors int4 expert
+    if ".block_sparse_moe.experts." in name and name.endswith(".weight_packed"): return "x"  # K3 mxfp4 expert
     # Split resident weights by type for mixed-precision control:
     #   "sh" = shared expert (fires on every token, highest sensitivity)
     #   "o"  = o_proj attention (reconstructs output, biggest attn tensor)
@@ -267,10 +269,15 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
                                        "kv_a_proj_with_mqa.weight")): return "attn"
     if any(name.endswith(k) for k in ("mlp.gate_proj.weight", "mlp.up_proj.weight",
                                        "mlp.down_proj.weight")): return "dmlp"
+    # K3 per-layer residual mixers ([1, hidden]) -- tiny, keep f32 rather than paying a
+    # 1-row int8 quantization for no byte savings that matter.
+    if name.endswith(("mlp_res_proj.weight", "self_attention_res_proj.weight",
+                      "output_attn_res_proj.weight")): return "f32"
     if name.endswith(".weight"): return "q"              # fallback: other resident weights
     if name.endswith(".weight_packed"):
-        raise SystemExit(f"unexpected compressed-tensors int4 tensor outside routed experts: "
-                          f"{name} — this converter only transcodes .mlp.experts.*.weight_packed")
+        raise SystemExit(f"unexpected compressed-tensors packed tensor outside routed experts: "
+                          f"{name} — this converter only transcodes .mlp.experts.* (K2 int4) and "
+                          f".block_sparse_moe.experts.* (K3 mxfp4) .weight_packed tensors")
     return "f32"
 
 # ---------- dequant NVFP4 (modelopt) di UN tensore expert -> f32 [O,I] ----------
@@ -395,6 +402,53 @@ def transcode_compressed_int4(codes, scale):
         out[:, :v1.shape[1]] |= (v1 << 4)
     return out.reshape(-1), scale.reshape(-1).astype(ml_dtypes.bfloat16)
 
+# ---------- compressed-tensors 'mxfp4-pack-quantized' (Kimi K3) ----------
+def transcode_mxfp4(f, packed_name):
+    """compressed-tensors mxfp4 (Kimi K3) -> colibri mxfp4 container, RAW PASSTHROUGH.
+    Layout -- verified bit-exact against the compressed-tensors 0.17.1 reference
+    primitives (unpack_fp4_from_uint8 + decompress_mx_scale) on a real K3 shard
+    (model-00002-of-000096, layer-1 expert-0 w1, maxdiff = 0.0):
+      <base>.weight_packed  U8 [O, I/2]  : two e2m1 nibbles per byte along the input dim,
+                                           LOW nibble = even element (same convention as
+                                           NVFP4/_E2M1, per the compressed-tensors/vLLM
+                                           fp4 pack).
+      <base>.weight_scale   U8 [O, I/32] : e8m0 per-32-group scale, value = 2^(u8 - 127).
+    Unlike K2's int4 pack there is NO .weight_shape sidecar: I derives from the packed
+    width (x2), cross-checked against the scale group count (16 packed bytes per group
+    of 32). mxfp4's e2m1 grid is NOT representable in fmt=4's uniform int4 grid (the
+    ratios 0.5..6 would need codes up to +/-12), so unlike K2 there is no transcode INTO
+    fmt=4 -- instead the bytes pass through VERBATIM (lossless by construction, zero
+    convert-time math) as a new container format the engine recognizes by the .qs dtype:
+      <base>.weight     U8 [O*ceil(I/2)] : the nibble bytes, exactly as in the source
+      <base>.weight.qs  U8 [O*I/32]      : the e8m0 bytes, exactly as in the source
+    Engine decode contract (pinned by test_transcode_mxfp4_is_raw_passthrough):
+      w[o,i] = _E2M1[nibble(o,i)] * 2^(qs[o, i//32] - 127)
+    Guards mirror unpack_compressed_int4's: refuse any swizzled/padded/other-dtype
+    layout loudly instead of silently corrupting a 1.4 TB conversion."""
+    GS = 32
+    base = packed_name[:-len(".weight_packed")]
+    packed = f.get_tensor(packed_name).numpy()
+    scale = f.get_tensor(base + ".weight_scale").numpy()
+    if packed.dtype != np.uint8:
+        raise ValueError(f"{packed_name}: weight_packed dtype {packed.dtype}, expected uint8")
+    if scale.dtype != np.uint8:
+        raise ValueError(f"{packed_name}: weight_scale dtype {scale.dtype}, expected uint8 "
+                          "(e8m0); a non-u8 scale means a different mxfp4 revision, refusing "
+                          "to reinterpret its bytes")
+    if packed.ndim != 2 or scale.ndim != 2 or scale.shape[0] != packed.shape[0]:
+        raise ValueError(f"{packed_name}: weight_scale rows {scale.shape} vs weight_packed "
+                          f"{packed.shape}; layout unexpected, refusing to corrupt")
+    if packed.shape[1] % (GS // 2):
+        raise ValueError(f"{packed_name}: packed width {packed.shape[1]} bytes is not a "
+                          f"multiple of {GS//2} (input dim not a multiple of the group size "
+                          f"{GS}); layout unexpected, refusing to corrupt")
+    ngroups = packed.shape[1] // (GS // 2)               # = ceil(I/32), I = packed_cols*2
+    if scale.shape[1] != ngroups:
+        raise ValueError(f"{packed_name}: weight_scale has {scale.shape[1]} columns, expected "
+                          f"{ngroups} = (packed_cols*2)/{GS}; scale layout unexpected "
+                          "(swizzled/padded?), refusing to corrupt")
+    return packed.reshape(-1), scale.reshape(-1)
+
 # ---------- dequant di un tensore (nvfp4 / fp8+scale a blocchi / bf16 / f32) ----------
 def dequant(f, name, keys):
     import torch
@@ -455,10 +509,15 @@ def _shard_tensor_groups(path, n_layers, ebits, io_bits, xbits,
             name = strip_lm_prefix(raw_name)
             kind = classify(name, n_layers, keep_mtp, keep_idx)
             if kind in ("skip", "consumed"): continue
-            if kind == "x" and name.endswith(".weight_packed"):    # K2: lossless int4 transcode
+            if kind == "x" and name.endswith(".weight_packed"):    # K2/K3: lossless transcode
                 base = name[:-len(".weight_packed")]
-                codes, scale = unpack_compressed_int4(f, raw_name)
-                q, s = transcode_compressed_int4(codes, scale)
+                # Dispatch on the .weight_shape sidecar, present in K2's int4 pack and
+                # absent from K3's mxfp4 pack -- file-driven, no config plumbing needed.
+                if (raw_name[:-len(".weight_packed")] + ".weight_shape") in keys:
+                    codes, scale = unpack_compressed_int4(f, raw_name)   # K2 int4
+                    q, s = transcode_compressed_int4(codes, scale)
+                else:
+                    q, s = transcode_mxfp4(f, raw_name)                  # K3 mxfp4 passthrough
                 yield [(base + ".weight", q), (base + ".weight.qs", s)]
                 continue
             w = dequant(f, raw_name, keys)
@@ -769,6 +828,11 @@ def _write_metadata(src_dir, outdir):
         print(f"[META] WARNING: not found in {src_dir}: {', '.join(missing)}"
               + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
 
+# Both lossless-transcode source formats: K2/K2.6's int4 pack and K3's mxfp4 pack.
+# Anything in this set defaults residents to int8 (bf16 in the source, must not drop
+# to int4) and never consults --xbits for its routed experts.
+_PACK_QUANT_FORMATS = ("pack-quantized", "mxfp4-pack-quantized")
+
 def _source_is_pack_quantized(a):
     """Best-effort peek at the source config.json. --indir reads it in place; --repo
     reads the copy a previous/resumed run left in <outdir>/_meta or <outdir>, else
@@ -781,7 +845,7 @@ def _source_is_pack_quantized(a):
     for d in dirs:
         try:
             cfg = flatten_container_config(json.loads(open(os.path.join(d, "config.json")).read()))
-            return cfg.get("quantization_config", {}).get("format") == "pack-quantized"
+            return cfg.get("quantization_config", {}).get("format") in _PACK_QUANT_FORMATS
         except (OSError, ValueError, AttributeError):
             continue
     if a.repo and a.outdir:
@@ -790,7 +854,7 @@ def _source_is_pack_quantized(a):
             meta_dir = os.path.join(a.outdir, "_meta"); os.makedirs(meta_dir, exist_ok=True)
             hf_hub_download(a.repo, "config.json", local_dir=meta_dir)
             cfg = flatten_container_config(json.loads(open(os.path.join(meta_dir, "config.json")).read()))
-            return cfg.get("quantization_config", {}).get("format") == "pack-quantized"
+            return cfg.get("quantization_config", {}).get("format") in _PACK_QUANT_FORMATS
         except Exception:
             return False
     return False
@@ -965,8 +1029,9 @@ def main():
         try:
             src_cfg = json.loads(open(os.path.join(a.indir, "config.json")).read())
             src_cfg = flatten_container_config(src_cfg)
-            if src_cfg.get("quantization_config", {}).get("format") == "pack-quantized":
-                x_note = "transcode (lossless, source is pack-quantized; --xbits ignored)"
+            src_fmt = src_cfg.get("quantization_config", {}).get("format")
+            if src_fmt in _PACK_QUANT_FORMATS:
+                x_note = f"transcode (lossless, source is {src_fmt}; --xbits ignored)"
         except (OSError, ValueError, AttributeError):
             pass
     print(f"[PLAN] mode: {mode} | source: {'local ' + a.indir if a.indir else 'download ' + a.repo} | "

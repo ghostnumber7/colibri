@@ -1077,3 +1077,230 @@ def test_refuses_to_resume_old_style_progress_json(tmp_path):
     assert r.returncode == 0, r.stderr   # the guard prints an ERROR and returns cleanly, doesn't crash
     assert "ERROR" in r.stdout and "OLDER converter version" in r.stdout, r.stdout
     assert not glob.glob(str(out / "out-*.safetensors")), "must not have written anything"
+
+
+# ---------- Kimi-K3: mxfp4-pack-quantized expert transcode + kimi_linear tensor names ----------
+# K3 (moonshotai/Kimi-K3) quantizes ONLY its routed experts, as compressed-tensors
+# "mxfp4-pack-quantized": e2m1 nibbles in <base>.weight_packed U8 [O, I/2] (LOW nibble =
+# even element, the same convention as NVFP4/_E2M1) + <base>.weight_scale U8 [O, I/32]
+# e8m0 per-32-group scales (value = 2^(u8 - 127)). Unlike K2's int4 pack there is NO
+# .weight_shape sidecar: I derives from the packed width (x2) and is cross-checked
+# against the scale group count (16 packed bytes per group of 32). The transcode is a
+# raw byte PASSTHROUGH -- lossless by construction, no decode/requant math at convert
+# time: .weight = the nibble bytes verbatim, .weight.qs = the e8m0 bytes verbatim.
+# Engine decode contract (u8 .qs marks the mxfp4 format): w = _E2M1[nibble] * 2^(qs-127).
+
+
+def _mxfp4_reference_dequant(packed, scale, gs=32):
+    """Reference decoder for compressed-tensors mxfp4-pack-quantized -- the value the
+    engine's future mxfp4 kernel must reproduce from the passthrough bytes."""
+    O, Ih = packed.shape; I = Ih * 2
+    nib = np.empty((O, I), np.int64)
+    nib[:, 0::2] = packed & 0x0F
+    nib[:, 1::2] = (packed >> 4) & 0x0F
+    w4 = np.array(cvt._E2M1, np.float32)[nib]
+    sc = np.exp2(scale.astype(np.float32) - 127.0)
+    return w4 * np.repeat(sc, gs, axis=1)[:, :I]
+
+
+def _synth_mxfp4(rng, O, I, gs=32):
+    packed = rng.integers(0, 256, size=(O, I // 2)).astype(np.uint8)
+    scale = rng.integers(100, 140, size=(O, I // gs)).astype(np.uint8)  # e8m0 around 2^-27..2^13
+    return packed, scale
+
+
+def test_transcode_mxfp4_is_raw_passthrough():
+    rng = np.random.default_rng(7)
+    O, I, gs = 4, 64, 32
+    packed, scale = _synth_mxfp4(rng, O, I, gs)
+    f = FakeST({"x.w1.weight_packed": packed, "x.w1.weight_scale": scale})
+    q, s = cvt.transcode_mxfp4(f, "x.w1.weight_packed")
+    assert q.dtype == np.uint8 and s.dtype == np.uint8, (
+        "mxfp4 passthrough must emit U8 nibbles and U8 e8m0 scales -- the u8 .qs dtype "
+        "is what marks the format for the engine loader")
+    assert q.shape == (O * (I // 2),)
+    assert s.shape == (O * (I // gs),)
+    assert np.array_equal(q, packed.reshape(-1))
+    assert np.array_equal(s, scale.reshape(-1))
+    # The decode CONTRACT: engine-side dequant of the emitted bytes must equal the
+    # reference decode of the source tensors (trivial given passthrough -- this pins
+    # the formula itself, so the engine kernel has a tested reference to match).
+    deq = _mxfp4_reference_dequant(q.reshape(O, I // 2), s.reshape(O, I // gs), gs)
+    ref = _mxfp4_reference_dequant(packed, scale, gs)
+    assert np.array_equal(deq, ref)
+
+
+def test_transcode_mxfp4_rejects_bad_layouts():
+    rng = np.random.default_rng(8)
+    O, I, gs = 4, 64, 32
+    packed, scale = _synth_mxfp4(rng, O, I, gs)
+    # 1) scale column count != packed_cols/16
+    f = FakeST({"x.w1.weight_packed": packed, "x.w1.weight_scale": scale[:, :-1]})
+    with pytest.raises(ValueError):
+        cvt.transcode_mxfp4(f, "x.w1.weight_packed")
+    # 2) scale row count != packed row count
+    f = FakeST({"x.w1.weight_packed": packed, "x.w1.weight_scale": scale[:-1]})
+    with pytest.raises(ValueError):
+        cvt.transcode_mxfp4(f, "x.w1.weight_packed")
+    # 3) packed width not a multiple of 16 bytes (I not a multiple of the group size)
+    f = FakeST({"x.w1.weight_packed": packed[:, :-1], "x.w1.weight_scale": scale})
+    with pytest.raises(ValueError):
+        cvt.transcode_mxfp4(f, "x.w1.weight_packed")
+    # 4) non-u8 scale (e.g. a future revision shipping bf16 scales) must refuse, not
+    #    silently reinterpret bytes as e8m0
+    f = FakeST({"x.w1.weight_packed": packed,
+                "x.w1.weight_scale": scale.astype(np.float32)})
+    with pytest.raises(ValueError):
+        cvt.transcode_mxfp4(f, "x.w1.weight_packed")
+
+
+def test_classify_k3_names():
+    n = 93
+    c = cvt.classify
+    # routed experts: mxfp4 packed + consumed sidecar
+    assert c("model.layers.5.block_sparse_moe.experts.3.w1.weight_packed", n) == "x"
+    assert c("model.layers.92.block_sparse_moe.experts.895.w2.weight_packed", n) == "x"
+    assert c("model.layers.5.block_sparse_moe.experts.3.w1.weight_scale", n) == "consumed"
+    # router + bias stay f32
+    assert c("model.layers.5.block_sparse_moe.gate.weight", n) == "f32"
+    assert c("model.layers.5.block_sparse_moe.gate.e_score_correction_bias", n) == "f32"
+    # latent-MoE projections: every-token residents, fall to the "q" resident class
+    assert c("model.layers.5.block_sparse_moe.routed_expert_up_proj.weight", n) == "q"
+    assert c("model.layers.5.block_sparse_moe.routed_expert_down_proj.weight", n) == "q"
+    assert c("model.layers.5.block_sparse_moe.routed_expert_norm.weight", n) == "f32"
+    assert c("model.layers.5.block_sparse_moe.shared_experts.up_proj.weight", n) == "sh"
+    # KDA linear-attention layers: projections are plain residents, norms/gates f32
+    assert c("model.layers.5.self_attn.q_proj.weight", n) == "q"
+    assert c("model.layers.5.self_attn.b_proj.weight", n) == "q"
+    assert c("model.layers.5.self_attn.f_b_proj.weight", n) == "q"
+    assert c("model.layers.5.self_attn.g_proj.weight", n) == "q"
+    assert c("model.layers.5.self_attn.o_proj.weight", n) == "o"
+    assert c("model.layers.5.self_attn.o_norm.weight", n) == "f32"
+    assert c("model.layers.5.self_attn.A_log", n) == "f32"
+    assert c("model.layers.5.self_attn.dt_bias", n) == "f32"
+    # MLA layers keep their existing classes
+    assert c("model.layers.4.self_attn.q_a_proj.weight", n) == "attn"
+    assert c("model.layers.4.self_attn.kv_b_proj.weight", n) == "kvb"
+    # per-layer residual mixers: [1, hidden] -- tiny, kept f32
+    assert c("model.layers.5.mlp_res_proj.weight", n) == "f32"
+    assert c("model.layers.5.self_attention_res_proj.weight", n) == "f32"
+    assert c("model.output_attn_res_proj.weight", n) == "f32"
+    assert c("model.output_attn_res_norm.weight", n) == "f32"
+    # layer 92 must NOT be dropped as MTP once n_layers=93 is read from the config
+    assert c("model.layers.92.self_attn.q_proj.weight", n) == "q"
+    # K2 names must classify EXACTLY as before (regression)
+    assert c("model.layers.5.mlp.experts.3.gate_proj.weight_packed", 61) == "x"
+    assert c("model.layers.5.mlp.gate.weight", 61) == "f32"
+
+
+def test_shard_groups_k3_expert_passthrough_and_conv_kept_f32(tmp_path):
+    """End-to-end through _shard_tensor_groups on a real safetensors file with K3
+    naming (language_model. prefix, block_sparse_moe experts, conv1d, A_log): the
+    mxfp4 expert must be emitted as verbatim u8 .weight/.weight.qs (dispatched on the
+    ABSENCE of the .weight_shape sidecar, present only in K2's int4 pack), the 3D
+    conv1d weight must be kept f32 (ndim guard), and a bf16 KDA projection must be
+    int8-quantized (ebits=8) -- with vision dropped and the prefix stripped."""
+    import torch
+    from safetensors.torch import save_file as save_file_pt
+    rng = np.random.default_rng(9)
+    O, I, gs = 8, 64, 32
+    packed, scale = _synth_mxfp4(rng, O, I, gs)
+    Oq, Iq = 16, 32
+    p = str(tmp_path / "shard.safetensors")
+    base = "language_model.model.layers.2.block_sparse_moe.experts.0.w1"
+    save_file_pt({
+        base + ".weight_packed": torch.from_numpy(packed),
+        base + ".weight_scale": torch.from_numpy(scale),
+        "language_model.model.layers.2.self_attn.q_conv1d.weight":
+            torch.from_numpy(rng.standard_normal((Iq, 1, 4)).astype(np.float32)),
+        "language_model.model.layers.2.self_attn.A_log":
+            torch.from_numpy(rng.standard_normal(8).astype(np.float32)),
+        "language_model.model.layers.2.self_attn.q_proj.weight":
+            torch.from_numpy(rng.standard_normal((Oq, Iq)).astype(np.float32) * 0.02).to(torch.bfloat16),
+        "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(8, 8).to(torch.bfloat16),
+    }, p)
+    vision_counts = {}
+    groups = list(cvt._shard_tensor_groups(p, n_layers=93, ebits=8, io_bits=8, xbits=8,
+                                            group_size=64, vision_counts=vision_counts))
+    tensors = {name: arr for group in groups for name, arr in group}
+    assert vision_counts == {"vision_tower": 1}
+    assert not any(n.startswith("language_model.") for n in tensors)
+    ex_base = "model.layers.2.block_sparse_moe.experts.0.w1"
+    assert tensors[ex_base + ".weight"].dtype == np.uint8
+    assert tensors[ex_base + ".weight.qs"].dtype == np.uint8
+    assert np.array_equal(tensors[ex_base + ".weight"], packed.reshape(-1))
+    assert np.array_equal(tensors[ex_base + ".weight.qs"], scale.reshape(-1))
+    conv = tensors["model.layers.2.self_attn.q_conv1d.weight"]
+    assert conv.dtype == np.float32 and conv.shape == (Iq, 1, 4), "3D conv must be kept f32, not quantized"
+    assert tensors["model.layers.2.self_attn.A_log"].dtype == np.float32
+    qp = tensors["model.layers.2.self_attn.q_proj.weight"]
+    assert qp.size == Oq * Iq, f"KDA q_proj must be int8 (O*I bytes), got {qp.size} for O={Oq},I={Iq}"
+    assert "model.layers.2.self_attn.q_proj.weight.qs" in tensors
+
+
+def test_indir_convert_k3_synthetic_end_to_end(tmp_path):
+    """Full --indir conversion of a synthetic K3-shaped checkpoint: nested kimi_k3
+    config (text_config model_type=kimi_linear, num_hidden_layers read from it), one
+    shard with language_model.-prefixed K3 names including an mxfp4 expert and a vision
+    tensor. Asserts: the resolved [PLAN] says lossless transcode + int8 residents (both
+    driven by the mxfp4-pack-quantized format, no flags), the emitted container has the
+    verbatim u8 expert bytes, the flattened config, and no vision/prefix leakage."""
+    import torch
+    from safetensors.torch import save_file as save_file_pt
+    rng = np.random.default_rng(11)
+    src = tmp_path / "k3_src"; src.mkdir()
+    n_layers = 2
+    (src / "config.json").write_text(json.dumps(
+        {"model_type": "kimi_k3", "architectures": ["KimiK3ForConditionalGeneration"],
+         "text_config": {"model_type": "kimi_linear", "num_hidden_layers": n_layers,
+                          "quantization_config": {"format": "mxfp4-pack-quantized",
+                                                   "config_groups": {}}},
+         "vision_config": {"patch_size": 14}}))
+    O, I, gs = 8, 64, 32
+    packed, scale = _synth_mxfp4(rng, O, I, gs)
+    base = "language_model.model.layers.1.block_sparse_moe.experts.0.w1"
+    save_file_pt({
+        base + ".weight_packed": torch.from_numpy(packed),
+        base + ".weight_scale": torch.from_numpy(scale),
+        "language_model.model.layers.1.self_attn.q_proj.weight":
+            torch.from_numpy(rng.standard_normal((16, 32)).astype(np.float32) * 0.02).to(torch.bfloat16),
+        "language_model.model.layers.1.input_layernorm.weight":
+            torch.from_numpy(rng.standard_normal(16).astype(np.float32)).to(torch.bfloat16),
+        "vision_tower.encoder.blocks.0.wqkv.weight": torch.randn(8, 8).to(torch.bfloat16),
+    }, str(src / "model-00001-of-00001.safetensors"))
+
+    out = tmp_path / "k3_out"
+    # No --ebits: must default to 8 from the mxfp4-pack-quantized format.
+    r = _run_convert(src, out, ["--io-bits", "8", "--group-size", "64", "--jobs", "1"])
+    assert "experts 8-bit" in r.stdout, r.stdout
+    assert "transcode (lossless, source is mxfp4-pack-quantized" in r.stdout, r.stdout
+
+    tensors, _ = _load_union(out)
+    ex = "model.layers.1.block_sparse_moe.experts.0.w1"
+    assert tensors[ex + ".weight"].dtype == np.uint8
+    assert tensors[ex + ".weight.qs"].dtype == np.uint8
+    assert np.array_equal(tensors[ex + ".weight"], packed.reshape(-1))
+    assert np.array_equal(tensors[ex + ".weight.qs"], scale.reshape(-1))
+    assert not any(n.startswith(("language_model.", "vision_tower.")) for n in tensors)
+    got_cfg = json.loads((out / "config.json").read_text())
+    assert got_cfg["model_type"] == "kimi_linear" and "text_config" not in got_cfg
+
+
+def test_resolve_default_ebits_mxfp4_pack_quantized_source_is_8(tmp_path):
+    """K3's quantization_config.format is "mxfp4-pack-quantized" -- like K2's
+    "pack-quantized" it means the residents ship bf16 and must default to int8, not
+    fp8-source int4 (the over-quantization regression the pack-quantized default fixed)."""
+    d = tmp_path / "src"; d.mkdir()
+    (d / "config.json").write_text(json.dumps(
+        {"quantization_config": {"format": "mxfp4-pack-quantized"}}))
+    a = types.SimpleNamespace(mtp=False, indexer=False, indir=str(d), repo=None, outdir=None)
+    assert cvt._resolve_default_ebits(a) == 8
+    # nested K3-style container config resolves the same way
+    d2 = tmp_path / "nested"; d2.mkdir()
+    (d2 / "config.json").write_text(json.dumps(
+        {"model_type": "kimi_k3",
+         "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
+                          "quantization_config": {"format": "mxfp4-pack-quantized"}}}))
+    a2 = types.SimpleNamespace(mtp=False, indexer=False, indir=str(d2), repo=None, outdir=None)
+    assert cvt._resolve_default_ebits(a2) == 8
+    assert cvt.read_n_layers_from_config(str(d2)) == 93
