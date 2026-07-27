@@ -1563,20 +1563,52 @@ def main():
               "proj_bits": dict(PROJ_BITS)}
     if not check_or_record_params(a.outdir, "out-", params): return
     vision_totals = {}   # single-process download loop -- a plain shared dict is fine here
+    # PIPELINE: while shard i converts (CPU/disk-bound, network idle), shard i+1
+    # downloads in a background thread -- without this the link sits dead for the
+    # whole conversion of every shard (~40-50% of wall time on a fast line).
+    # download_retry is segment-resumable and writes only its own blob/.seg files,
+    # so the worst a crash costs is re-joining a partial. The prefetch is skipped
+    # when disk headroom couldn't hold blob + output + margin.
+    import threading as _thr
+    pre = {"sh": None, "path": None, "err": None, "t": None}
+    def _prefetch(sh_next):
+        try:
+            pre["path"] = download_retry(a.repo, sh_next, tmp)
+        except BaseException as e:                    # main loop retries synchronously
+            pre["err"] = e
+    def _next_missing(after):
+        for j in range(after + 1, len(shards)):
+            if not os.path.exists(os.path.join(a.outdir, f"out-{j:05d}.safetensors")):
+                return j
+        return -1
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
         outp = os.path.join(a.outdir, f"out-{i:05d}.safetensors")
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
-        print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
-        p = download_retry(a.repo, sh, tmp)
+        if pre["t"]: pre["t"].join()
+        if pre["sh"] == sh and pre["err"] is None and pre["path"]:
+            p = pre["path"]                               # prefetched while the previous shard converted
+        else:
+            print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
+            p = download_retry(a.repo, sh, tmp)           # resumes any prefetch partial
+        pre.update(sh=None, path=None, err=None, t=None)
+        nj = _next_missing(i)
+        if nj >= 0 and free_gb(a.outdir) > a.min_free_gb + 40:
+            print(f"[{i+1}/{len(shards)}] converting {sh} while prefetching {shards[nj]}...", flush=True)
+            pre["sh"] = shards[nj]
+            pre["t"] = _thr.Thread(target=_prefetch, args=(shards[nj],), daemon=True)
+            pre["t"].start()
         out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size,
                                  bits_map=bits_map, vision_counts=vision_totals)
         save_file(out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
+            # never touch the in-flight prefetch blob or its .seg resume sidecars
+            if pre["sh"] and pre["sh"] in os.path.basename(blob): continue
             if os.path.isfile(blob): os.remove(blob)
         print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)
+    if pre["t"]: pre["t"].join()                           # never orphan a downloader thread
     shutil.rmtree(tmp, ignore_errors=True)
     total_dropped = sum(vision_totals.values())
     if total_dropped:
