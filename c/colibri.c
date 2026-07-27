@@ -190,6 +190,8 @@ typedef struct {
     QT kda_fa, kda_fb, kda_b;                    /* low-rank gate f_a [hd,D] f_b [P,hd]; beta [heads,D] */
     float *kda_qconv, *kda_kconv, *kda_vconv;    /* depthwise causal conv [P,1,conv] f32, SILU */
     float *kda_alog, *kda_dtbias, *kda_onorm;    /* A_log (per-dim or per-head), dt_bias [P], o_norm [hd] */
+    int kda_alog_n;                              /* A_log length: ==head_dim -> per-dim (real K3),
+                                                  * ==num_heads -> per-head (released modeling / 48B) */
     QT attn_gate;                                /* g_proj output gate: KDA full-rank gate AND the
                                                   * NoPE-MLA sigmoid output gate (both [P, hidden]) */
     QT lat_down, lat_up; float *lat_norm;        /* latent MoE residents around the routed experts */
@@ -219,6 +221,12 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
 
 typedef struct {
     float **Lc, **Rc, **Ic;
+    /* KDA (kimi_linear) per-layer recurrent state, CONSTANT in context length:
+     *   kdaS[i] = [H, hd, hd] f32 delta-rule state (KDA layers only, else NULL)
+     *   kdaC[i] = [3, P, conv-1] f32 conv tails (q/k/v streams)
+     *   kda_pos[i] = next position this state expects. The recurrence cannot
+     *   rewind: pos 0 resets the state, any other mismatch is a hard error. */
+    float **kdaS, **kdaC; int *kda_pos;
     int *kv_start, max_t;
     int disk_nrec;
     char disk_path[2048];
@@ -242,6 +250,8 @@ typedef struct {
      * volo con kv_b. E' cio' che rende gestibile il contesto su 15 GB (64 teste, no GQA). */
     float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
+    float **kdaS, **kdaC; int *kda_pos;          /* alias: KDA recurrent state (kimi_linear) */
+    float *out_res_norm, *out_res_proj;          /* model-level residual mixer (attn_res_block_size) */
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
@@ -1068,6 +1078,9 @@ static void rope_table_init(Cfg *c, jval *r){
 
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
+    if(c->mla_nope) return;   /* Kimi-K3: NoPE -- the rope-dim halves participate RAW
+                               * (rotary_emb=None in modeling_kimi_linear); one guard
+                               * here covers every attention path consistently. */
     int half = c->qk_rope/2;
     /* Validate against the fixed buffers (in[256], cache cs/sn[128] -> qk_rope<=256).
      * Abort cleanly instead of smashing the stack. (GLM-5.2 qk_rope=64.) (#183) */
@@ -1568,6 +1581,10 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
     m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
     m->final_norm = ld(m,"model.norm.weight");
+    if(m->c.res_block){   /* K3 model-level residual mixer, applied before the final norm */
+        m->out_res_norm=ld(m,"model.output_attn_res_norm.weight");
+        m->out_res_proj=ld(m,"model.output_attn_res_proj.weight");
+    }
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
@@ -1600,6 +1617,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->kda_fb = qt_load(m,P("self_attn.f_b_proj.weight"), Pk, c->kda_head_dim, dbits);
             l->kda_b  = qt_load(m,P("self_attn.b_proj.weight"), c->kda_heads, D, dbits);
             l->kda_alog = ld(m,P("self_attn.A_log"));
+            l->kda_alog_n = (int)st_numel(&m->S,P("self_attn.A_log"));
+            if(l->kda_alog_n!=c->kda_head_dim && l->kda_alog_n!=c->kda_heads){
+                fprintf(stderr,"layer %d: A_log has %d entries; expected head_dim %d (per-dim, "
+                        "real K3) or num_heads %d (per-head) -- see docs/K3-PORT.md\n",
+                        i,l->kda_alog_n,c->kda_head_dim,c->kda_heads); exit(1); }
             l->kda_dtbias=ld(m,P("self_attn.dt_bias"));
             l->kda_onorm =ld(m,P("self_attn.o_norm.weight"));
             l->attn_gate = qt_load(m,P("self_attn.g_proj.weight"), Pk, D, dbits);
@@ -2926,6 +2948,18 @@ done:
 }
 #endif
 
+/* Kimi-K3 MLA output gate (mla_use_output_gate): ctx[s, H*vh] *= sigmoid(g_proj(x)).
+ * Applied to the assembled per-head context right before o_proj, on BOTH the absorb
+ * and non-absorb tails (modeling_kimi_linear.KimiMLAAttention.forward). */
+static void mla_output_gate(Model *m, Layer *l, const float *x, float *ctx, int S){
+    Cfg *c=&m->c; if(!c->mla_out_gate) return;
+    int64_t n=(int64_t)S*c->n_heads*c->v_head;
+    float *gt=falloc(n);
+    matmul_qt(gt,(float*)x,&l->attn_gate,S);
+    for(int64_t z=0;z<n;z++) ctx[z]*=1.f/(1.f+expf(-gt[z]));
+    free(gt);
+}
+
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -3128,6 +3162,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         int cuda_core=0,cuda_projected=0;
 #ifdef COLI_CUDA
         if(kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
+           !c->mla_out_gate&&   /* the fused project kernel has no output gate (K3) */
            !dnsel&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
             const float **rl=malloc((size_t)S*sizeof(*rl)),**rr=malloc((size_t)S*sizeof(*rr));
@@ -3285,7 +3320,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         }
         m->t_acore+=now_s()-tac; double tao=now_s();
-        if(!cuda_projected){matmul_qt(out, ctx, &l->o, S);} m->t_aout+=now_s()-tao;
+        if(!cuda_projected){ mla_output_gate(m,l,x,ctx,S); matmul_qt(out, ctx, &l->o, S); } m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp); free(sc_all);
         m->t_attn += now_s()-ta0;
         return;
@@ -3326,6 +3361,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
     }
     m->t_acore+=now_s()-tac; double tao=now_s();
+    mla_output_gate(m,l,x,ctx,S);
     matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
     free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(sc_all);
     m->t_attn += now_s()-ta0;
@@ -3333,6 +3369,143 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
 
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
     attention_rows(m,l,layer,x,S,pos_base,NULL,NULL,out);
+}
+
+/* ---- Kimi-K3 KDA (Kimi Delta Attention) recurrent cell -- docs/K3-PORT.md ----
+ * Per head h with state S_h [hd x hd] f32:
+ *   q,k,v = silu(short_conv(proj(x)))                (depthwise causal, kernel CK)
+ *   q,k   = l2norm per head; q *= hd^-0.5
+ *   g     = lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))  per channel
+ *   beta  = sigmoid(b_proj(x))                        per head
+ *   S_h   = S_h ⊙ exp(g_h)[:,None];  S_h += (beta_h·k_h) ⊗ (v_h − k_hᵀS_h)
+ *   o_h   = q_hᵀ S_h;  o = rmsnorm(o)⊙o_norm⊙sigmoid(g_proj(x));  out = o_proj(o)
+ * A_log is per-DIM (len hd, the real K3 checkpoint) or per-HEAD (len H, the
+ * released modeling file / Kimi-Linear-48B) -- decided by tensor length at load.
+ * Rows run SEQUENTIALLY (it is a recurrence); prefill uses the same cell per
+ * token. State lives in the bound KVState (kdaS/kdaC/kda_pos), CONSTANT in
+ * context length. pos_base==0 resets it; any other mismatch is a hard error --
+ * linear attention cannot rewind (no per-position cache to truncate to). */
+static void kda_forward_rows(Model *m, Layer *l, int li, const float *x, int S,
+                             int pos_base, float *out){
+    Cfg *c=&m->c; int H=c->kda_heads, hd=c->kda_head_dim, P=H*hd, CK=c->kda_conv;
+    KVState *k=m->kv;
+    if(!k->kdaS || !k->kdaS[li] || !k->kdaC || !k->kda_pos){
+        fprintf(stderr,"KDA state missing for layer %d (kv_alloc ran before has_kda?)\n",li); exit(1); }
+    if(pos_base==0){ memset(k->kdaS[li],0,(size_t)H*hd*hd*sizeof(float));
+                     memset(k->kdaC[li],0,(size_t)3*P*(CK-1)*sizeof(float));
+                     k->kda_pos[li]=0; }
+    if(k->kda_pos[li]!=pos_base){
+        fprintf(stderr,"KDA layer %d: got position %d but the recurrent state is at %d -- "
+                "linear attention cannot rewind; restart the context\n",li,pos_base,k->kda_pos[li]);
+        exit(1); }
+    double ta0=now_s();
+    float *q=falloc((int64_t)S*P), *kx=falloc((int64_t)S*P), *v=falloc((int64_t)S*P);
+    float *g=falloc((int64_t)S*P), *fa=falloc((int64_t)S*hd), *beta=falloc((int64_t)S*H);
+    float *gate=falloc((int64_t)S*P), *o=falloc((int64_t)S*P);
+    matmul_qt(q,(float*)x,&l->kda_q,S);  matmul_qt(kx,(float*)x,&l->kda_k,S);
+    matmul_qt(v,(float*)x,&l->kda_v,S);
+    matmul_qt(fa,(float*)x,&l->kda_fa,S); matmul_qt(g,fa,&l->kda_fb,S);
+    matmul_qt(beta,(float*)x,&l->kda_b,S);
+    matmul_qt(gate,(float*)x,&l->attn_gate,S);
+    /* depthwise causal conv + SILU, sequential over rows; the tail cache keeps the
+     * last CK-1 RAW projected values per channel per stream (q/k/v). */
+    { const float *cw[3]={l->kda_qconv,l->kda_kconv,l->kda_vconv};
+      float *st3[3]={q,kx,v};
+      for(int t=0;t<S;t++) for(int w=0;w<3;w++){
+          float *row=st3[w]+(int64_t)t*P;
+          float *tail=k->kdaC[li]+(int64_t)w*P*(CK-1);
+          #pragma omp parallel for schedule(static)
+          for(int ch=0;ch<P;ch++){
+              const float *wc=cw[w]+(int64_t)ch*CK;      /* [P,1,CK], LAST tap = current */
+              float *tl=tail+(int64_t)ch*(CK-1);
+              float a=wc[CK-1]*row[ch];
+              for(int j=0;j<CK-1;j++) a+=wc[j]*tl[j];
+              for(int j=0;j<CK-2;j++) tl[j]=tl[j+1];      /* shift, then store the RAW input */
+              tl[CK-2]=row[ch];
+              row[ch]=siluf(a);
+          } }
+    }
+    float lb=c->kda_lower_bound, qscale=1.f/sqrtf((float)hd);
+    int alog_dim = (l->kda_alog_n==hd);   /* per-dim (K3) vs per-head (48B-style) */
+    for(int t=0;t<S;t++){
+        const float *qr=q+(int64_t)t*P, *kr=kx+(int64_t)t*P, *vr=v+(int64_t)t*P;
+        const float *gr=g+(int64_t)t*P, *br=beta+(int64_t)t*H, *gt=gate+(int64_t)t*P;
+        float *orow=o+(int64_t)t*P;
+        #pragma omp parallel for schedule(static)
+        for(int h=0;h<H;h++){
+            float *Sh=k->kdaS[li]+(int64_t)h*hd*hd;
+            const float *qh=qr+(int64_t)h*hd, *kh=kr+(int64_t)h*hd, *vh=vr+(int64_t)h*hd;
+            float err[4096], ob[4096];                    /* hd <= 4096 (CKR) */
+            float sq=0,sk=0;
+            for(int d=0;d<hd;d++){ sq+=qh[d]*qh[d]; sk+=kh[d]*kh[d]; }
+            float rq=qscale/sqrtf(sq+1e-6f), rk=1.f/sqrtf(sk+1e-6f);
+            float bh=1.f/(1.f+expf(-br[h]));
+            for(int vv=0;vv<hd;vv++) err[vv]=vh[vv];
+            for(int d=0;d<hd;d++){
+                float a = alog_dim ? l->kda_alog[d] : l->kda_alog[h];
+                float graw = gr[(int64_t)h*hd+d] + l->kda_dtbias[(int64_t)h*hd+d];
+                float gval = lb/(1.f+expf(-expf(a)*graw));     /* lb * sigmoid(exp(A)*graw) */
+                float dec = expf(gval);
+                float kn = kh[d]*rk;
+                float *Srow=Sh+(int64_t)d*hd;
+                for(int vv=0;vv<hd;vv++){ Srow[vv]*=dec; err[vv]-=kn*Srow[vv]; }
+            }
+            for(int d=0;d<hd;d++){
+                float w2=bh*kh[d]*rk; float *Srow=Sh+(int64_t)d*hd;
+                for(int vv=0;vv<hd;vv++) Srow[vv]+=w2*err[vv];
+            }
+            for(int vv=0;vv<hd;vv++) ob[vv]=0;
+            for(int d=0;d<hd;d++){
+                float qv=qh[d]*rq; const float *Srow=Sh+(int64_t)d*hd;
+                for(int vv=0;vv<hd;vv++) ob[vv]+=qv*Srow[vv];
+            }
+            float ss=0; for(int vv=0;vv<hd;vv++) ss+=ob[vv]*ob[vv];
+            float rn=1.f/sqrtf(ss/(float)hd + c->eps);
+            const float *gh=gt+(int64_t)h*hd;
+            for(int vv=0;vv<hd;vv++)
+                orow[(int64_t)h*hd+vv] = ob[vv]*rn*l->kda_onorm[vv]/(1.f+expf(-gh[vv]));
+        }
+    }
+    matmul_qt(out,o,&l->o,S);
+    k->kda_pos[li]=pos_base+S;
+    free(q); free(kx); free(v); free(g); free(fa); free(beta); free(gate); free(o);
+    m->t_attn += now_s()-ta0;
+}
+
+/* Residual-mixer block state for the CURRENT forward pass, owned by
+ * layers_forward_rows (alloc'd before the layer loop, freed after the final
+ * output mix). Module-static because layer_forward_rows' signature is shared
+ * with the GLM/MTP paths; the engine runs one forward at a time. */
+static float *g_k3_bres=NULL; static int g_k3_nb=0;
+
+/* ---- Kimi-K3 residual mixer (attn_res_block_size) -- _apply_attn_res ----
+ * Per token: candidates = [block snapshots..., cur]; score each by its
+ * rmsnormed (weight-free) dot with (norm.weight ⊙ proj.weight); softmax over
+ * candidates; output = Σ p_i · candidate_i (UN-normalized). bres layout:
+ * [snapshot][row][D], nb snapshots so far. */
+static void k3_apply_attn_res(const Cfg *c, const float *cur, const float *bres, int nb,
+                              int S, const float *norm_w, const float *proj_w, float *dst){
+    int D=c->hidden;
+    #pragma omp parallel for schedule(static)
+    for(int s=0;s<S;s++){
+        float sc[32]; /* nb <= n_layers/res_block + 1, tiny */
+        for(int j=0;j<=nb;j++){
+            const float *v = j<nb ? bres+((int64_t)j*S+s)*D : cur+(int64_t)s*D;
+            float ss=0; for(int d=0;d<D;d++) ss+=v[d]*v[d];
+            float r=1.f/sqrtf(ss/(float)D + c->eps);
+            float a=0; for(int d=0;d<D;d++) a+=v[d]*r*norm_w[d]*proj_w[d];
+            sc[j]=a;
+        }
+        float mx=sc[0]; for(int j=1;j<=nb;j++) if(sc[j]>mx) mx=sc[j];
+        float tot=0; for(int j=0;j<=nb;j++){ sc[j]=expf(sc[j]-mx); tot+=sc[j]; }
+        float *dd=dst+(int64_t)s*D;
+        for(int d=0;d<D;d++) dd[d]=0;
+        for(int j=0;j<=nb;j++){
+            const float *v = j<nb ? bres+((int64_t)j*S+s)*D : cur+(int64_t)s*D;
+            float p=sc[j]/tot;
+            for(int d=0;d<D;d++) dd[d]+=p*v[d];
+        }
+    }
 }
 
 /* MoE GLM su x[S,hidden] -> out (router sigmoid/noaux_tc, n_group=1, + shared expert).
@@ -4881,8 +5054,34 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
         }
     }
 #endif
+    if(c->res_block && g_k3_bres){
+        /* Kimi-K3 DenseFormer-style flow (docs/K3-PORT.md, _forward_attn_residual):
+         * snapshot the RAW layer input into the block at li%rb==0 (and suppress this
+         * layer's own incoming residual), mix the running prefix against the block
+         * before attention and again before the MLP. bres/g_k3_nb are owned by
+         * layers_forward_rows for the duration of one forward. */
+        int nb=g_k3_nb; float *h=falloc((int64_t)S*D); int snapped=0;
+        if(nb>0) k3_apply_attn_res(c,x,g_k3_bres,nb,S,l->res_attn_norm,l->res_attn_proj,h);
+        else memcpy(h,x,(size_t)S*D*sizeof(float));
+        if(li%c->res_block==0){
+            memcpy(g_k3_bres+((int64_t)nb*S)*D, x, (size_t)S*D*sizeof(float));
+            g_k3_nb=++nb; snapped=1;
+        }
+        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, h+(int64_t)s*D, l->in_ln, D, c->eps);
+        if(l->is_kda) kda_forward_rows(m,l,li,nrm,S,pos_base,tmp);
+        else attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
+        if(snapped) memcpy(x,tmp,(size_t)S*D*sizeof(float));   /* prefix_sum restarts at attn */
+        else for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+        k3_apply_attn_res(c,x,g_k3_bres,g_k3_nb,S,l->res_mlp_norm,l->res_mlp_proj,h);
+        for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, h+(int64_t)s*D, l->post_ln, D, c->eps);
+        if(l->sparse) moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
+        for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+        free(h);
+        return;
+    }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
-    attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
+    if(l->is_kda) kda_forward_rows(m,l,li,nrm,S,pos_base,tmp);
+    else attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse){
@@ -4923,6 +5122,15 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
 #endif
+    if(c->has_kda && kvs){
+        fprintf(stderr,"kimi_linear: the batched multi-context decode path (ragged kvs) is not "
+                       "supported -- the KDA recurrent state binds to ONE context per forward\n");
+        exit(1);
+    }
+    if(c->res_block){   /* K3 residual-mixer block: snapshots at layers 0, rb, 2rb, ... */
+        int nbmax=c->n_layers/c->res_block+2;
+        g_k3_bres=falloc((int64_t)nbmax*S*D); g_k3_nb=0;
+    }
     for(int i=0;i<c->n_layers;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
@@ -4979,6 +5187,13 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
 #ifdef COLI_CUDA
     if(x_dev_on>=0) coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
 #endif
+    if(c->res_block && g_k3_bres){
+        /* K3 model-level output mix, applied to the final prefix_sum against the
+         * full snapshot block, BEFORE the caller's final model.norm. */
+        k3_apply_attn_res(c,x,g_k3_bres,g_k3_nb,S,m->out_res_norm,m->out_res_proj,tmp);
+        memcpy(x,tmp,(size_t)S*D*sizeof(float));
+        free(g_k3_bres); g_k3_bres=NULL; g_k3_nb=0;
+    }
     free(nrm); free(tmp);
 }
 static void layers_forward(Model *m, float *x, int S, int pos_base){
@@ -5005,10 +5220,32 @@ static void kv_alloc(Model *m, int max_t){
         k->Ic=calloc(c->n_layers,sizeof(float*));
         for(int i=0;i<c->n_layers;i++) if(c->idx_type[i]) k->Ic[i]=falloc((int64_t)max_t*c->index_hd);
     }
+    /* KDA recurrent state (kimi_linear): CONSTANT-size per layer, only for KDA
+     * layers -- the DSA Ic[] per-layer-conditional pattern. Size does not depend
+     * on max_t, but (re)allocate here so every KVState owns its own state. */
+    if(k->kdaS){ for(int i=0;i<c->n_layers;i++){ free(k->kdaS[i]); free(k->kdaC[i]); }
+                 free(k->kdaS); free(k->kdaC); free(k->kda_pos);
+                 k->kdaS=NULL; k->kdaC=NULL; k->kda_pos=NULL; }
+    if(c->has_kda){
+        int P=c->kda_heads*c->kda_head_dim;
+        k->kdaS=calloc(c->n_layers,sizeof(float*));
+        k->kdaC=calloc(c->n_layers,sizeof(float*));
+        k->kda_pos=calloc(c->n_layers,sizeof(int));
+        for(int i=0;i<c->n_layers && i<128;i++) if(c->kda[i]){
+            k->kdaS[i]=falloc((int64_t)c->kda_heads*c->kda_head_dim*c->kda_head_dim);
+            k->kdaC[i]=falloc((int64_t)3*P*(c->kda_conv-1));
+            memset(k->kdaS[i],0,(size_t)c->kda_heads*c->kda_head_dim*c->kda_head_dim*sizeof(float));
+            memset(k->kdaC[i],0,(size_t)3*P*(c->kda_conv-1)*sizeof(float));
+        }
+    }
     k->max_t=max_t;
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
     k->Lc=calloc(NR,sizeof(float*)); k->Rc=calloc(NR,sizeof(float*));
-    for(int i=0;i<NR;i++){ k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
+    for(int i=0;i<NR;i++){
+        if(i<c->n_layers && i<128 && c->kda[i]){   /* KDA layers keep NO growing KV:
+            * 69 of K3's 93 layers -- skipping them is most of the point of the arch */
+            k->Lc[i]=NULL; k->Rc[i]=NULL; continue; }
+        k->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
         k->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
 #ifdef COLI_METAL
         /* page-align + register Lc/Rc for zero-copy GPU attention. falloc isn't 16K-aligned,
@@ -5024,12 +5261,14 @@ static void kv_alloc(Model *m, int max_t){
 #endif
     }
     m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic; m->max_t=k->max_t; m->kv_start=k->kv_start;
+    m->kdaS=k->kdaS; m->kdaC=k->kdaC; m->kda_pos=k->kda_pos;
 }
 
 static void kv_bind(Model *m, KVState *k){
     if(m->kv!=k && m->kv_dev_valid)                 /* ombra legata al KVState corrente */
         for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
+    m->kdaS=k->kdaS; m->kdaC=k->kdaC; m->kda_pos=k->kda_pos;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
 
@@ -6081,6 +6320,8 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     free(k->disk_buf); k->disk_buf=NULL;
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
+    if(k->kdaS) for(int i=0;i<m->c.n_layers;i++){ free(k->kdaS[i]); free(k->kdaC[i]); }
+    free(k->kdaS); free(k->kdaC); free(k->kda_pos);
     free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
 }
 
@@ -7091,6 +7332,15 @@ static double kv_pool_bytes(Model *m, int max_ctx){
     Cfg *c=&m->c; double one=(double)(c->n_layers+1)*max_ctx*(c->kv_lora+c->qk_rope)*4.0;
     if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
         one+=(double)max_ctx*c->index_hd*4.0;
+    if(c->has_kda){   /* KDA layers keep NO growing KV -- swap their rows for the
+                       * constant recurrent state (kv_alloc mirrors this exactly) */
+        double P=(double)c->kda_heads*c->kda_head_dim;
+        for(int i=0;i<c->n_layers && i<128;i++) if(c->kda[i]){
+            one-=(double)max_ctx*(c->kv_lora+c->qk_rope)*4.0;
+            one+=((double)c->kda_heads*c->kda_head_dim*c->kda_head_dim
+                  + 3.0*P*(c->kda_conv-1))*4.0;
+        }
+    }
     int slots=kv_slot_count(); if(slots<1||slots>16) slots=1;
     return one*slots;
 }
