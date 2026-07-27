@@ -1,0 +1,9 @@
+{
+ "ebits": 8,
+ "io_bits": 8,
+ "xbits": 8,
+ "group_size": 64,
+ "n_layers": 7,
+ "bits_map": {},
+ "proj_bits": {}
+}
