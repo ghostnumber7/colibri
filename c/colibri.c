@@ -96,24 +96,6 @@ typedef struct {
     char model_type[32];                          /* config.json "model_type", e.g. "kimi_k2".
                                                     * Selects the chat template at the prompt-building
                                                     * sites -- a plain string compare, no arch enum. */
-    float rope_beta_fast;                          /* config.json rope_scaling.beta_fast, 1.0 if no
-                                                    * yarn block at all (GLM). FALLBACK discriminator
-                                                    * for K2.6 vs K2-Thinking when source_variant below
-                                                    * is empty -- see mt_is_k26 in sample.h. Set by
-                                                    * rope_table_init(). */
-    char source_variant[24];                       /* config.json "_colibri_source_variant", e.g.
-                                                    * "kimi_k25". Stamped by the converter's
-                                                    * _write_config_file only when it flattened a
-                                                    * K2.6-style nested source (see
-                                                    * convert_fp8_to_int4.py) -- a structural fact about
-                                                    * which container this is, unlike rope_beta_fast
-                                                    * (a YaRN tuning value with no semantic tie to
-                                                    * template choice, kept only as a fallback for
-                                                    * containers converted before this marker existed).
-                                                    * Empty string ("") when absent, e.g. K2-Thinking,
-                                                    * GLM, or an older K2.6 container -- mt_is_k26 then
-                                                    * falls back to rope_beta_fast. Plain string compare,
-                                                    * no arch enum. */
 } Cfg;
 
 /* tensore [O,I] in uno di tre formati:
@@ -917,7 +899,6 @@ static inline float siluf(float x){ return x/(1.f+expf(-x)); }
  * expression the engine computed inline before -- so GLM containers are
  * bit-identical. qk_rope <= 256 is enforced below, so half <= 128. */
 static float g_inv_freq[128];
-static int   g_inv_freq_n = 0;
 static int   g_yarn = 0;            /* 1 = YaRN frequencies are in the table */
 static float g_yarn_mscale = 1.0f;  /* multiplies cos/sin; 1.0 without YaRN */
 
@@ -933,8 +914,7 @@ static double yarn_get_mscale(double scale, double mscale){
 static void rope_table_init(Cfg *c, jval *r){
     int dim = c->qk_rope, half = dim/2;
     if(dim > 256){ fprintf(stderr,"qk_rope=%d exceeds the rope table (256)\n",dim); exit(1); }
-    g_inv_freq_n = half; g_yarn = 0; g_yarn_mscale = 1.0f;
-    c->rope_beta_fast = 1.0f;           /* default: no yarn block (GLM) / step-not-ramp (K2-Thinking) */
+    g_yarn = 0; g_yarn_mscale = 1.0f;
     for(int j=0;j<half;j++) g_inv_freq[j] = powf(c->theta, -2.0f*j/(float)dim);
 
     jval *sc = json_get(r,"rope_scaling");
@@ -982,14 +962,6 @@ static void rope_table_init(Cfg *c, jval *r){
     jval *jms = json_get(sc,"mscale"),     *jma = json_get(sc,"mscale_all_dim");
     double beta_fast = jbf ? jbf->num : 32.0, beta_slow = jbs ? jbs->num : 1.0;
     double mscale    = jms ? jms->num : 1.0,  mscale_all = jma ? jma->num : 1.0;
-    /* K2.6-vs-K2-Thinking discriminator, see Cfg/mt_is_k26. Deliberately NOT beta_fast:
-     * the math above defaults a missing beta_fast to 32.0 (the reference default), but
-     * 32.0 is exactly the value that MEANS K2.6 to the discriminator. Storing the default
-     * would make a yarn config with no explicit beta_fast key render as K2.6 here while
-     * c/coli and c/openai_server.py -- which both test isinstance(beta_fast,(int,float))
-     * and so read absent as NOT-K2.6 -- render it as K2-Thinking. Same directory, two
-     * prompt formats, no error. Record absence as 1.0f so all three sites agree. */
-    c->rope_beta_fast = jbf ? (float)beta_fast : 1.0f;
 
     double lo_d = yarn_correction_dim(beta_fast, dim, (double)c->theta, orig);
     double hi_d = yarn_correction_dim(beta_slow, dim, (double)c->theta, orig);
@@ -1098,10 +1070,6 @@ static void load_cfg(Cfg *c, const char *snap){
       if(mtv && mtv->str){ strncpy(c->model_type,mtv->str,sizeof(c->model_type)-1);
                             c->model_type[sizeof(c->model_type)-1]=0; }
       else c->model_type[0]=0; }
-    { jval *svv=json_get(r,"_colibri_source_variant");   /* see mt_is_k26 in sample.h */
-      if(svv && svv->str){ strncpy(c->source_variant,svv->str,sizeof(c->source_variant)-1);
-                            c->source_variant[sizeof(c->source_variant)-1]=0; }
-      else c->source_variant[0]=0; }
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
@@ -1839,6 +1807,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
+                qt[k]->s_bf16=0;   /* this path only runs for F32 .qs (mqs.sbytes==4 above);
+                                    * the slot may have last held a BF16 expert */
             }
             /* CPU pre-touch: fault the pages in HERE (cheap, parallel, overlapped with the
              * resident-experts GPU submit) so the GPU never demand-faults file-backed pages
@@ -6256,38 +6226,19 @@ static void run_serve_mux(Model *m, const char *snap){
 }
 
 /* Build the templated bytes for one interactive turn (run_serve's line protocol only --
- * the API/mux path hands over already-templated bytes, see mux_submit). `first` gates the
- * once-per-conversation prefix: GLM's [gMASK]<sop> and K2-Thinking's default system preamble
- * both only belong at the start of a session, exactly like the reference chat_template.jinja
- * (K2-Thinking's preamble is emitted only when the message list doesn't already open with a
- * system turn -- here that is equivalent to "this is turn 1").
- *
- * K2-Thinking (is_k2 && !is_k26) gets NO think marker at all: unlike GLM's
- * <think></think>-means-nothink convention, K2-Thinking decides on its own, per generation,
- * whether to open <think> -- there is no template-level lever for it, so `tk` is not used
- * on that path.
- *
- * K2.6 (is_k2 && is_k26) is a DIFFERENT real chat_template.jinja (pinned from the
- * checkpoint's own file, rendered through transformers' Jinja2 env):
- * it never emits a default system preamble (`first` is irrelevant on this path -- the
- * real template has no such block at all, not even a first-turn-only one), and it
- * ALWAYS emits a think marker after the assistant turn -- <think> or <think></think>,
- * exactly GLM's THINK-env convention, reusing `tk` unchanged. */
-static int build_turn_prompt(char *buf, int bufsz, int is_k2, int is_k26, int templ, int first,
+ * the API/mux path hands over already-templated bytes, see mux_submit). `first` gates
+ * GLM's once-per-session [gMASK]<sop> prefix; Kimi-K2.6's template (pinned from the
+ * checkpoint's own chat_template.jinja) has no session prefix and no default system
+ * preamble. Both templates share the THINK convention: `tk` is <think> (thinking) or
+ * <think></think> (nothink) after the assistant turn. */
+static int build_turn_prompt(char *buf, int bufsz, int is_k2, int templ, int first,
                               const char *input, const char *tk){
     if(!templ) return snprintf(buf,bufsz,"%s",input);
     int bl=0;
     if(is_k2){
-        if(is_k26){
-            bl+=snprintf(buf+bl,bufsz-bl,
-                "<|im_user|>user<|im_middle|>%s<|im_end|><|im_assistant|>assistant<|im_middle|>%s",
-                input,tk);
-            return bl;
-        }
-        if(first) bl+=snprintf(buf+bl,bufsz-bl,
-            "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>");
         bl+=snprintf(buf+bl,bufsz-bl,
-            "<|im_user|>user<|im_middle|>%s<|im_end|><|im_assistant|>assistant<|im_middle|>",input);
+            "<|im_user|>user<|im_middle|>%s<|im_end|><|im_assistant|>assistant<|im_middle|>%s",
+            input,tk);
         return bl;
     }
     if(first) bl+=snprintf(buf+bl,bufsz-bl,"[gMASK]<sop>");
@@ -6391,11 +6342,9 @@ static void run_serve(Model *m, const char *snap){
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
          * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
          * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita.
-         * (K2-Thinking non ha questa leva: build_turn_prompt ignora tk sul path K2-Thinking, vedi
-         * sopra. K2.6 SI' -- stessa convenzione THINK, vedi build_turn_prompt.) */
+         * (Kimi-K2.6 usa la stessa convenzione THINK, vedi build_turn_prompt.) */
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
         int is_k2 = mt_is_k2(&m->c);
-        int is_k26 = mt_is_k26(&m->c);
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
@@ -6412,10 +6361,10 @@ static void run_serve(Model *m, const char *snap){
                 active,len,prompt_tokens,k);
             free(tmp);
         } else {
-            bl=build_turn_prompt(buf,1<<16,is_k2,is_k26,templ,first,input,tk);
+            bl=build_turn_prompt(buf,1<<16,is_k2,templ,first,input,tk);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
             if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
-                bl=build_turn_prompt(buf,1<<16,is_k2,is_k26,templ,1,input,tk);
+                bl=build_turn_prompt(buf,1<<16,is_k2,templ,1,input,tk);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
                 prompt_tokens=k;
             }

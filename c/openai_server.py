@@ -373,9 +373,8 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-ARCH = "glm"   # set in main(): "glm" | "inkling" (auto-detected from the model's config.json)
-IS_K26 = False  # set in main() (and cmd_serve, coli's in-process caller): True when ARCH=="kimi_k2"
-                # AND the container is Kimi-K2.6 rather than K2-Thinking -- see detect_k26.
+ARCH = "glm"   # set in main() (and cmd_serve, coli's in-process caller): "glm" | "inkling" |
+               # "kimi_k2", auto-detected from the model's config.json (see detect_arch)
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -604,47 +603,24 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
 
 
 def render_chat_k2(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                   tool_choice=None, is_k26=False):
-    """Render Kimi-K2-Thinking's OR Kimi-K2.6's chat_template.jinja, verbatim (read from
-    the source checkpoint -- the converted container ships no jinja file). Both share
-    <|im_system|>/<|im_user|>/<|im_assistant|> role tokens wrapped in <|im_middle|>...
-    <|im_end|>, and every HISTORY assistant turn gets a stripped, EMPTY think block
-    unconditionally (reasoning from earlier turns is never replayed into context; the
-    template's separate reasoning_content "resume" path applies only to a trailing
-    partial turn being continued, an edge case outside coli run/chat/serve's scope).
-
-    They differ in exactly the two ways is_k26 selects (pinned from each checkpoint's own
-    chat_template.jinja, rendered through transformers' Jinja2 env, not hand-traced):
-      1. K2-Thinking (is_k26=False, the default -- keeps every existing call site's
-         behavior byte-for-byte unchanged) injects a default system preamble UNLESS the
-         caller already supplies one, and appends NO think marker at all to the
-         generation prompt: K2-Thinking decides on its own, per request, whether to open
-         <think> as its first generated tokens -- `enable_thinking`/`reasoning_effort` are
-         accepted only for call-site symmetry with render_chat/render_chat_inkling and
-         have no effect.
-      2. K2.6 (is_k26=True) injects NO default system preamble, ever -- its real template
-         has no such block at all, not even a first-turn-only one. Its generation prompt
-         ALWAYS ends in a think marker: "<think>" when enable_thinking, else
-         "<think></think>" -- exactly GLM's THINK-env convention (see render_chat), just
-         via this checkpoint's own template tokens.
-
-    Both checkpoints report model_type=="kimi_k2"; is_k26 must be resolved by the caller
-    (see detect_k26) since this function stays a pure renderer, like render_chat/
-    render_chat_inkling, testable without a model directory on disk.
+                   tool_choice=None):
+    """Render Kimi-K2.6's chat_template.jinja, verbatim (pinned from the source
+    checkpoint's own file through transformers' Jinja2 env -- the converted container
+    ships no jinja file). No default system preamble; every HISTORY assistant turn gets
+    a stripped, EMPTY think block (reasoning from earlier turns is never replayed into
+    context); the generation prompt always ends in a think marker -- "<think>" when
+    enable_thinking, else "<think></think>" -- exactly GLM's convention (see
+    render_chat), just via this checkpoint's own template tokens. A pure renderer, like
+    render_chat/render_chat_inkling, testable without a model directory on disk.
 
     Tool calling uses a hard-forked wire format (<|tool_calls_section_begin|>...) that is
-    not wired up yet -- same scope decision already made for render_chat_inkling, for
-    both K2-Thinking and K2.6."""
+    not wired up yet -- same scope decision already made for render_chat_inkling."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     if tools or (tool_choice not in (None, "none")):
         raise APIError(400, "Tool use is not wired up for the Kimi-K2 engine yet.",
                        "tools", "unsupported_parameter")
     prompt = []
-    first_role = messages[0].get("role") if isinstance(messages[0], dict) else None
-    if not is_k26 and first_role not in ("system", "developer"):
-        prompt.append("<|im_system|>system<|im_middle|>You are Kimi, an AI assistant "
-                      "created by Moonshot AI.<|im_end|>")
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
@@ -656,20 +632,12 @@ def render_chat_k2(messages, enable_thinking=False, reasoning_effort=None, tools
         elif role == "user":
             prompt.append(f"<|im_user|>user<|im_middle|>{text}<|im_end|>")
         elif role == "assistant":
-            # chat_template.jinja: every HISTORY assistant turn gets a stripped, EMPTY think
-            # block unconditionally -- reasoning from earlier turns is never replayed into
-            # context. (The template's separate reasoning_content "resume" path applies only
-            # to a trailing partial turn being continued, an edge case outside coli run/
-            # chat/serve's scope.) Identical for K2-Thinking and K2.6.
             prompt.append(f"<|im_assistant|>assistant<|im_middle|><think></think>{text}<|im_end|>")
         else:
             raise APIError(400, f"Unsupported message role: {role!r}.",
                            f"messages.{index}.role", "unsupported_role")
-    if is_k26:
-        prompt.append("<|im_assistant|>assistant<|im_middle|><think>" if enable_thinking
-                      else "<|im_assistant|>assistant<|im_middle|><think></think>")
-        return "".join(prompt)
-    prompt.append("<|im_assistant|>assistant<|im_middle|>")
+    prompt.append("<|im_assistant|>assistant<|im_middle|><think>" if enable_thinking
+                  else "<|im_assistant|>assistant<|im_middle|><think></think>")
     return "".join(prompt)
 
 
@@ -2023,11 +1991,8 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         renderer = {"inkling": render_chat_inkling, "kimi_k2": render_chat_k2}.get(ARCH, render_chat)
-        # is_k26 only applies to render_chat_k2 (ARCH=="kimi_k2"); render_chat/
-        # render_chat_inkling don't accept the kwarg, so it is passed conditionally.
-        k26_kwargs = {"is_k26": IS_K26} if ARCH == "kimi_k2" else {}
         prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                          tool_choice, **k26_kwargs)
+                          tool_choice)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking)
 
@@ -2063,9 +2028,8 @@ class APIHandler(BaseHTTPRequestHandler):
         # Same renderer-selection dict as chat_completion's (:1840 as of this writing) --
         # without it every non-GLM arch (including K2) gets GLM's [gMASK]<sop> template here.
         renderer = {"inkling": render_chat_inkling, "kimi_k2": render_chat_k2}.get(ARCH, render_chat)
-        k26_kwargs = {"is_k26": IS_K26} if ARCH == "kimi_k2" else {}
         prompt = renderer(messages, enable_thinking, "high" if enable_thinking else None,
-                          tools, tool_choice, **k26_kwargs)
+                          tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
@@ -2336,10 +2300,9 @@ def detect_arch(model_dir):
     going through argparse/serve().
 
     Catches json.JSONDecodeError alongside OSError: `coli serve` (c/coli's cmd_serve)
-    now calls this directly, unguarded, before its own try/finally that removes the
-    pidfile -- a syntactically-invalid config.json used to raise uncaught here, crashing
-    `coli serve` and leaving a stale pidfile behind. detect_k26 below already caught both;
-    this widens detect_arch to match."""
+    calls this directly before its own try/finally that removes the pidfile -- a
+    syntactically-invalid config.json used to raise uncaught here, crashing `coli serve`
+    and leaving a stale pidfile behind."""
     model_type = ""
     try:
         with open(Path(model_dir) / "config.json") as fh:
@@ -2356,57 +2319,6 @@ def detect_arch(model_dir):
     if model_type == "kimi_k2":
         return "kimi_k2"
     return "glm"
-
-
-def detect_k26(model_dir):
-    """Is this container Kimi-K2.6 rather than K2-Thinking? Only meaningful when
-    detect_arch already returned "kimi_k2" -- both report that identical model_type
-    (the converter deliberately drops K2.6's distinguishing outer model_type "kimi_k25"
-    instead of merging it, to protect the exact-match template selectors; see
-    convert_fp8_to_int4.flatten_container_config's docstring), so model_type alone
-    cannot discriminate here.
-
-    Marker-first, string comparison only (no arch enum): the converter's
-    _write_config_file stamps an explicit top-level `_colibri_source_variant: "kimi_k25"`
-    onto config.json whenever it flattens a K2.6-style nested source -- a structural fact
-    about which container this is, not a tuning value that could drift for unrelated
-    reasons. Checked first; when present it decides the answer outright. K2-Thinking
-    containers never go through the nested-flatten path, so they never carry this key --
-    absence correctly means "not K2.6" for them, unchanged from before this marker existed.
-
-    rope_scaling.beta_fast is kept as a documented FALLBACK for containers converted
-    before this marker existed: the one config value verified to genuinely differ between
-    the two REAL checkpoints (checked directly against both real configs, not a fixture
-    artifact): K2-Thinking's validated container config.json has beta_fast=1.0 (a step,
-    zero blended YaRN dimensions); K2.6's real source config.json has beta_fast=32.0 (11
-    genuinely blended dimensions -- see c/tests/test_yarn_rope.c).
-    Both share the same tokenizer family (identical bos/eos/pad/vocab_size), so those
-    cannot discriminate. Only consulted when the marker is absent: beta_fast is a YaRN
-    tuning hyperparameter with no semantic tie to template choice, so a future point
-    release could change it for unrelated reasons and silently flip the template if it
-    were the sole discriminator -- the marker exists to remove exactly that risk.
-
-    Fail-soft default is False (K2-Thinking's behavior), same reasoning as detect_arch's
-    fail-soft "glm": an unreadable/malformed config.json must never silently switch to a
-    template nobody asked for."""
-    try:
-        with open(Path(model_dir) / "config.json") as fh:
-            cfg = json.load(fh)
-    except (OSError, ValueError):
-        return False
-    # Guard rather than a wider `except`: every `.get` below sits OUTSIDE the try, so an
-    # AttributeError from a valid-JSON-but-not-an-object config.json (`null`, `[]`, `3`)
-    # would escape uncaught. Same fail-soft contract as the OSError/ValueError paths.
-    if not isinstance(cfg, dict):
-        return False
-    text_cfg = cfg.get("text_config")
-    if isinstance(text_cfg, dict):
-        cfg = text_cfg
-    marker = cfg.get("_colibri_source_variant")
-    if marker is not None:
-        return marker == "kimi_k25"
-    beta_fast = (cfg.get("rope_scaling") or {}).get("beta_fast")
-    return isinstance(beta_fast, (int, float)) and beta_fast > 1.0
 
 
 def main():
@@ -2433,11 +2345,10 @@ def main():
              "(reverse proxy / MagicDNS in front of the loopback bind); repeat as needed, "
              "or set COLI_ALLOWED_HOSTS as a comma-separated list")
     args = parser.parse_args()
-    global ARCH, IS_K26
+    global ARCH
     ARCH = args.arch
     if ARCH == "auto":
         ARCH = detect_arch(args.model)
-    IS_K26 = ARCH == "kimi_k2" and detect_k26(args.model)
     if args.model_id is None:
         args.model_id = {"inkling": "inkling-colibri",
                          "kimi_k2": "kimi-k2-colibri"}.get(ARCH, "glm-5.2-colibri")

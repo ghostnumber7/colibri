@@ -169,16 +169,11 @@ def need_model(model):
 
 def flatten_config(cfg):
     """K2.6 nests its real params inside cfg["text_config"] (a top-level model_type of
-    "kimi_k25" plus a sibling "vision_config"); K2-Thinking/GLM configs are already flat.
-    Mirrors convert_fp8_to_int4.py's flatten_container_config (same shape, same "emit
-    text_config verbatim, carry nothing from the top level" rule) so every `coli`-side
-    reader of a config.json -- whether it is pointed at an unconverted source repo (still
-    nested) or an already-converted container (already flat, since the converter flattens
-    on write) -- reports the same values either way. A single shared accessor instead of
-    three independent nested-vs-flat checks: see model_type_of, cmd_info, and
-    _convert_features, all of which used to read the config root directly and would
-    silently see empty/wrong values (e.g. pack_quantized=False, forcing --ebits 4 onto
-    resident tensors that must stay int8) for a K2.6-shaped nested config."""
+    "kimi_k25" plus a sibling "vision_config"); GLM configs are already flat. Mirrors
+    convert_fp8_to_int4.py's flatten_container_config (same "emit text_config verbatim,
+    carry nothing from the top level" rule) so every `coli`-side reader -- an unconverted
+    source repo (still nested) or a converted container (flattened on write) -- reports
+    the same values either way. Shared by model_type_of, cmd_info and cmd_convert."""
     if isinstance(cfg, dict) and isinstance(cfg.get("text_config"), dict):
         return cfg["text_config"]
     return cfg
@@ -190,42 +185,6 @@ def model_type_of(model_dir):
             return flatten_config(json.load(f)).get("model_type") or ""
     except Exception:
         return ""
-
-def is_k26_of(model_dir):
-    """Is this container Kimi-K2.6 rather than K2-Thinking? Both report the identical
-    model_type "kimi_k2" once converted (the converter deliberately drops K2.6's
-    distinguishing outer model_type "kimi_k25" instead of merging it -- merging would
-    restore "kimi_k25" and silently break the exact-match template selectors, see
-    convert_fp8_to_int4.flatten_container_config's docstring), so model_type alone cannot
-    tell them apart here.
-
-    Marker-first, string comparison only (no arch enum): the converter's
-    _write_config_file stamps an explicit top-level `_colibri_source_variant: "kimi_k25"`
-    onto config.json whenever it flattens a K2.6-style nested source -- a structural fact
-    about which container this is, not a tuning value that could drift for unrelated
-    reasons. Checked first; when present it decides the answer outright.
-
-    rope_scaling.beta_fast is kept as a documented FALLBACK for containers converted
-    before this marker existed (or a raw, unconverted source pointed at directly): the one
-    config value verified to genuinely differ between the two REAL checkpoints (not a
-    fixture artifact -- checked directly against both real configs): K2-Thinking's
-    validated container's config.json has beta_fast=1.0 (a step, zero
-    blended YaRN dimensions); K2.6's real source config.json has beta_fast=32.0 (11
-    genuinely blended dimensions, see c/tests/test_yarn_rope.c). Both share the same tokenizer
-    family (identical bos/eos/pad/vocab_size), so those cannot discriminate. Only consulted
-    when the marker is absent -- a future point release could change beta_fast for
-    unrelated YaRN-tuning reasons with no marker in play, which is exactly the residual
-    risk the marker exists to remove."""
-    try:
-        with open(os.path.join(model_dir, "config.json")) as f:
-            c = flatten_config(json.load(f))
-        marker = c.get("_colibri_source_variant")
-        if marker is not None:
-            return marker == "kimi_k25"
-        beta_fast = (c.get("rope_scaling") or {}).get("beta_fast")
-        return isinstance(beta_fast, (int, float)) and beta_fast > 1.0
-    except Exception:
-        return False
 
 def cuda_binary():
     if not os.path.exists(GLM): return False
@@ -630,40 +589,20 @@ def cmd_doctor(a):
     print(json.dumps(report,indent=2) if a.json else format_doctor(report))
     return exit_code(report)
 
-def build_run_prompt(mt, prompt, is_k26=False):
-    """The launcher's chat-template string for `coli run`, selected by model_type (and,
-    for the Kimi-K2 family, by is_k26 -- see is_k26_of). Kept as a pure function (no env
-    lookups beyond THINK, no subprocess) so it is testable without an engine binary or a
-    real tokenizer.json -- see test_cli_output.py. Both tiny fixture containers ship no
-    tokenizer.json by design, so `coli run` itself cannot be exercised end-to-end here;
-    this is what actually changed and what the tests pin.
-
-    is_k26 defaults to False so every existing call site/test that only knows about
-    model_type keeps K2-Thinking's exact byte-for-byte behavior unchanged."""
+def build_run_prompt(mt, prompt):
+    """The launcher's chat-template string for `coli run`, selected by model_type.
+    Kept as a pure function (no env lookups beyond THINK, no subprocess) so it is
+    testable without an engine binary or a real tokenizer.json -- see test_cli_output.py."""
+    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
     if mt=="kimi_k2":
-        tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
-        if is_k26:
-            # Kimi-K2.6 template, pinned from the checkpoint's own chat_template.jinja
-            # rendered through transformers' Jinja2 env -- a DIFFERENT real template
-            # from K2-Thinking's: no default system preamble at
-            # all (not even first-turn-only), and it ALWAYS appends a think marker after
-            # the assistant turn, exactly GLM's THINK-env convention.
-            return (f"<|im_user|>user<|im_middle|>{prompt}<|im_end|>"
-                    f"<|im_assistant|>assistant<|im_middle|>{tk}")
-        # Kimi-K2-Thinking template, verbatim from the checkpoint's chat_template.jinja (see
-        # research-task4.md). K2 has no [gMASK]/<sop>: injecting GLM's prefix BPE-encodes
-        # into text the model never saw. The default system preamble is part of the
-        # template -- dropping it changes the prompt distribution. And unlike GLM there is
-        # NO <think> marker in the generation prompt: K2-Thinking opens one or not on its
-        # own, so there is deliberately no THINK branch here.
-        SYS="You are Kimi, an AI assistant created by Moonshot AI."
-        return (f"<|im_system|>system<|im_middle|>{SYS}<|im_end|>"
-                f"<|im_user|>user<|im_middle|>{prompt}<|im_end|>"
-                f"<|im_assistant|>assistant<|im_middle|>")
+        # Kimi-K2.6 template, pinned from the checkpoint's own chat_template.jinja
+        # rendered through transformers' Jinja2 env: no [gMASK]/<sop>, no default
+        # system preamble, and the think marker follows GLM's THINK-env convention.
+        return (f"<|im_user|>user<|im_middle|>{prompt}<|im_end|>"
+                f"<|im_assistant|>assistant<|im_middle|>{tk}")
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
     # <think> open so the engine emits its reasoning block; the default stays nothink.
-    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
     return f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
 
 def cmd_run(a):
@@ -671,7 +610,7 @@ def cmd_run(a):
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     mt=model_type_of(a.model)
     banner("run", mt)
-    e=env_for(a); e["PROMPT"]=build_run_prompt(mt, prompt, is_k26_of(a.model))
+    e=env_for(a); e["PROMPT"]=build_run_prompt(mt, prompt)
     sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
@@ -952,24 +891,14 @@ def cmd_serve(a):
     try:
         with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
-    # `coli serve` calls serve() in-process, bypassing openai_server.main() -- the ONLY
-    # place that otherwise sets the module-level ARCH/IS_K26 globals chat_completion's
-    # renderer-selection dict reads. Left unset, ARCH stays at its "glm" default for
-    # every model (K2-Thinking and K2.6 included): the HTTP server would silently render
-    # every prompt with GLM's [gMASK]<sop> template and inherit GLM's stop-sequence
-    # policy, regardless of what the engine subprocess actually is. Pre-existing gap
-    # (not introduced by K2.6 work), fixed here because it makes the is_k26 wiring for
-    # `coli serve` unreachable otherwise.
-    #
-    # detect_arch/detect_k26 calls live INSIDE this try/finally (not before it): both are
-    # fail-soft against a missing/malformed config.json, but a raise here -- of any kind,
-    # now or in the future -- must still not orphan the pidfile written above. Widening
-    # the try to cover them (rather than relying
-    # solely on detect_arch/detect_k26's own except clauses) means the pidfile is cleaned
-    # up even if a future change to either function reintroduces an unguarded raise.
+    # `coli serve` calls serve() in-process, bypassing openai_server.main() -- the only
+    # place that otherwise sets the module-level ARCH global the renderer-selection dict
+    # reads. Left unset, ARCH stays at its "glm" default and the HTTP server silently
+    # renders every prompt with GLM's [gMASK]<sop> template regardless of the model.
+    # detect_arch lives INSIDE this try/finally: it is fail-soft, but any raise here must
+    # still not orphan the pidfile written above.
     try:
         openai_server.ARCH = openai_server.detect_arch(a.model)
-        openai_server.IS_K26 = (openai_server.ARCH == "kimi_k2" and openai_server.detect_k26(a.model))
         openai_server.serve(a.model, a.host, a.port, a.model_id, a.api_key,
               a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots)
@@ -1071,59 +1000,11 @@ def cmd_bench(a):
     print(f"  {C.dim}decode is disk-bound: this takes HOURS on slow hardware. Raise --limit on faster machines.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
-def _convert_features(a):
-    """Feature-inspection for `coli convert`: reads config.json (local disk for
-    --indir, the hub for --repo) and returns the two checkpoint FACTS that drive
-    single-vs-two-pass and the bit defaults, instead of an --arch name:
-
-      has_mtp        = a genuine MTP (next-token-prediction) head is present
-                       (config `num_nextn_predict_layers` > 0).
-      pack_quantized = routed experts arrive pre-quantized compressed-tensors int4
-                       (K2-style: `quantization_config.format == "pack-quantized"`),
-                       which the converter transcodes losslessly instead of
-                       dequantizing FP8.
-
-    This is the root-cause fix for two Important findings that the old --arch-gated
-    design produced: deciding --ebits and 1-vs-2-pass without inspecting the
-    checkpoint made `coli convert --repo …Kimi-K2-Thinking` (a) quantize K2's bf16
-    resident tensors to int4 instead of the spec-required int8, and (b) under the
-    default `--arch auto` run GLM's MTP 2nd pass against a K2 repo (K2 has no MTP
-    head).
-
-    Any read failure (offline, hub hiccup, private repo without a token, malformed
-    config.json) falls back to (has_mtp=True, pack_quantized=False) -- the GLM-safe
-    default: GLM's own 2-pass flow, unchanged, is exactly what ran before this
-    inspection existed, so a failed inspection must never silently skip GLM's MTP
-    pass or force lossless bits it didn't ask for.
-
-    Kimi-K2.6 nests both `num_nextn_predict_layers` and `quantization_config` inside
-    `text_config` -- read flat, they silently report has_mtp=False (harmlessly correct
-    here, K2.6 has no MTP head either way) and pack_quantized=False, which forces
-    --ebits 4 onto resident tensors that must stay int8 (the exact regression this
-    branch already root-caused and fixed once for K2-Thinking). flatten_config funnels
-    the nested-vs-flat check through the same accessor as model_type_of/cmd_info."""
-    import json
-    try:
-        if getattr(a, "indir", None):
-            c = json.loads(open(os.path.join(a.indir, "config.json")).read())
-        else:
-            import urllib.request
-            txt = urllib.request.urlopen(
-                f"https://huggingface.co/{a.repo}/resolve/main/config.json", timeout=15).read().decode()
-            c = json.loads(txt)
-        c = flatten_config(c)
-        has_mtp = (c.get("num_nextn_predict_layers") or 0) > 0
-        pack_quantized = (c.get("quantization_config") or {}).get("format") == "pack-quantized"
-        return has_mtp, pack_quantized
-    except Exception:
-        return True, False
-
 def cmd_convert(a):
     banner("convert")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
     venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
-    has_mtp, pack_quantized = _convert_features(a)
 
     indir = getattr(a, "indir", None)
     if indir:
@@ -1132,35 +1013,33 @@ def cmd_convert(a):
             sys.exit(f"{C.yel}--outdir must differ from --indir{C.r} (never writes into the source)")
         src_flags = ["--indir", indir, "--outdir", outdir]
     else:
+        outdir = a.model
         src_flags = ["--repo", a.repo, "--outdir", a.model]
 
     base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"), *src_flags,
           "--io-bits", str(a.io_bits), "--group-size", str(a.group_size)]
-    # Only pass --ebits when the user set it explicitly; otherwise let the converter
-    # apply its own lossless int8 default -- protects bf16/pre-quantized resident
-    # tensors on a pack-quantized checkpoint (e.g. K2). Forcing a fixed value here
-    # unconditionally is exactly what used to silently over-quantize K2.
+    # Only pass --ebits when the user set it explicitly: the converter resolves the
+    # default from the checkpoint itself (fp8 sources keep GLM's historical int4;
+    # pack-quantized sources like Kimi-K2.6 keep their residents lossless int8).
     if a.ebits is not None: base += ["--ebits", str(a.ebits)]
     if a.xbits: base+=["--xbits",str(a.xbits)]
 
-    if pack_quantized:
-        # e.g. K2: routed experts are already quantized int4 (transcoded losslessly);
-        # single pass, no MTP (none of these checkpoints ship an MTP head), no
-        # aggressive bit flags -- the converter's lossless int8 default applies.
-        print(f"  {C.dim}[K2] single pass, no MTP: {' '.join(base)}{C.r}")
-        sys.exit(subprocess.call(base))
-
-    # GLM/fp8 path -- byte-identical to before this inspection refactor: only the
-    # entry condition changed (`arch != "kimi"` -> `not pack_quantized`). The
-    # converter's own default is now lossless int8, so GLM's streaming bits (int4
-    # residents) must be forced explicitly here instead of relying on the
-    # converter's old arch-driven default.
-    if a.ebits is None: base += ["--ebits", "4"]
-    # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
+    # passo 1: modello principale. Resumabile: riparte dagli shard mancanti.
     print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
     rc=subprocess.call(base)
     if rc!=0: sys.exit(rc)
-    if a.no_mtp or not has_mtp: sys.exit(0)
+    if a.no_mtp: sys.exit(0)
+    # The MTP pass is decided by the converted container's OWN config.json, written
+    # locally by pass 1 -- no network inspection. Fail-soft default is True: GLM's
+    # 2-pass flow is exactly what ran before this inspection existed, and a failed
+    # read must never silently skip GLM's MTP pass. Kimi-K2.6 has
+    # num_nextn_predict_layers=0, so it correctly stops after the single pass.
+    try:
+        with open(os.path.join(outdir, "config.json")) as f:
+            has_mtp = (flatten_config(json.load(f)).get("num_nextn_predict_layers") or 0) > 0
+    except Exception:
+        has_mtp = True
+    if not has_mtp: sys.exit(0)
     # passo 2: testa MTP (layer 78). SEMPRE int8: a int4 i draft sbagliano quasi sempre
     # (acceptance 0-4% vs 39-59%, misurato — issue #8) e la speculazione non parte mai.
     mtp_cmd=list(base)

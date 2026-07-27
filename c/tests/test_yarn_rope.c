@@ -45,7 +45,6 @@ int main(void){
         rope_table_init(&c, r);
         CHECK(g_yarn == 0);
         CHECK(g_yarn_mscale == 1.0f);
-        CHECK(g_inv_freq_n == 32);
         for(int j=0;j<32;j++){
             float want = powf(10000.f, -2.0f*j/64.0f);
             CHECK(g_inv_freq[j] == want);        /* BIT-identical to the old expression */
@@ -72,7 +71,6 @@ int main(void){
         rope_table_init(&c, r);
         CHECK(g_yarn == 1);
         CLOSE(g_yarn_mscale, 1.0, 1e-6);          /* mscale == mscale_all_dim */
-        CHECK(g_inv_freq_n == 32);
         /* DeepseekV3Attention applies a SEPARATE softmax-scale
          * correction, self.scaling *= get_mscale(factor,mscale_all_dim)**2 --
          * independent of the rotary g_yarn_mscale ratio above (which is 1.0 here
@@ -107,7 +105,7 @@ int main(void){
         free(ar);
     }
 
-    /* ---- 3b. K2.6 YaRN ramp: beta_fast=32.0 (vs K2-Thinking's 1.0 above)
+    /* ---- 3b. K2.6 YaRN ramp: beta_fast=32.0 (vs test 3's 1.0)
      * gives low=8, high=20 -- an 11-wide range (j=9..19) where the ramp is
      * strictly between 0 and 1, unlike test 3's low=19/high=20 step where no
      * j ever lands in the blend. This is the first test to exercise that
@@ -137,7 +135,6 @@ int main(void){
           "\"beta_slow\":1.0,\"mscale\":1.0,\"mscale_all_dim\":1.0}}", &ar);
         rope_table_init(&c, r);
         CHECK(g_yarn == 1);
-        CHECK(g_inv_freq_n == 32);
         CLOSE(g_yarn_mscale, 1.0, 1e-6);      /* mscale == mscale_all_dim, as in test 3 */
 
         /* Full-table check against the closed-form low=8,high=20 ramp. */
@@ -309,25 +306,11 @@ int main(void){
     printf("yarn rope tests: rope_parameters hard-exit subtest skipped on Windows\n");
 #endif
 
-    /* ---- beta_fast ABSENT: the YaRN math keeps its 32.0 reference default, but the
-     * K2.6 discriminator must record ABSENCE, not that default.
-     *
-     * These two uses of beta_fast pull in opposite directions. rope_table_init defaults a
-     * missing beta_fast to 32.0 because that is the reference default and the ramp must
-     * stay correct. But 32.0 is also the exact value mt_is_k26 reads as "this is K2.6".
-     * Storing the default into Cfg.rope_beta_fast therefore made a yarn config with no
-     * explicit beta_fast key render as K2.6 in the engine, while c/coli and
-     * c/openai_server.py -- which test isinstance(beta_fast,(int,float)) and so read
-     * absent as NOT-K2.6 -- rendered the same directory as K2-Thinking. Two prompt
-     * formats for one model, no error anywhere.
-     *
-     * Pinned here rather than in test_chat_template.c because that file's cfg_k2() helper
-     * sets rope_beta_fast directly; only rope_table_init can exercise the defaulting. ---- */
+    /* ---- beta_fast ABSENT: the YaRN math keeps its 32.0 reference default ---- */
     {
         Cfg c; memset(&c,0,sizeof c);
         c.qk_rope = 64; c.theta = 50000.f;
         c.attn_scale = 1.0f/8.0f;
-        strncpy(c.model_type, "kimi_k2", sizeof c.model_type - 1);
         char *ar=NULL;
         jval *r = parse(                      /* yarn block with NO beta_fast key */
           "{\"rope_scaling\":{\"type\":\"yarn\",\"factor\":64.0,"
@@ -336,30 +319,12 @@ int main(void){
         rope_table_init(&c, r);
         CHECK(g_yarn == 1);
 
-        /* The MATH still used 32.0: that gives low=8/high=20, so j=8 is pure
+        /* The math defaulted to 32.0: that gives low=8/high=20, so j=8 is pure
          * extrapolation and j=20 pure interpolation -- identical to the explicit
          * beta_fast=32.0 case above. Had the default regressed to 1.0, low/high would be
          * 19/20 and g_inv_freq[8] would be the unscaled extrapolated value instead. */
-        CHECK(g_inv_freq_n == 32);
         CLOSE(g_inv_freq[20], pow(50000.0, -40.0/64.0)/64.0, 1e-6);   /* interpolated */
-
-        /* ...but the DISCRIMINATOR records absence, matching the two Python sites. */
-        CLOSE(c.rope_beta_fast, 1.0, 1e-9);
-        CHECK(mt_is_k2(&c));
-        CHECK(!mt_is_k26(&c));
-
-        /* Control: the same config WITH beta_fast=32.0 is still K2.6. */
-        Cfg c2; memset(&c2,0,sizeof c2);
-        c2.qk_rope = 64; c2.theta = 50000.f; c2.attn_scale = 1.0f/8.0f;
-        strncpy(c2.model_type, "kimi_k2", sizeof c2.model_type - 1);
-        char *ar2=NULL;
-        jval *r2 = parse(
-          "{\"rope_scaling\":{\"type\":\"yarn\",\"factor\":64.0,"
-          "\"original_max_position_embeddings\":4096,\"beta_fast\":32.0,"
-          "\"beta_slow\":1.0,\"mscale\":1.0,\"mscale_all_dim\":1.0}}", &ar2);
-        rope_table_init(&c2, r2);
-        CLOSE(c2.rope_beta_fast, 32.0, 1e-9);
-        CHECK(mt_is_k26(&c2));
+        free(ar);
     }
 
     if(fails){ printf("yarn rope tests: %d FAILED\n", fails); return 1; }

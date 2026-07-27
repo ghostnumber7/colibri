@@ -156,45 +156,10 @@ static int mt_is_glm(const char *s){
     return 0;
 }
 
-/* Kimi-K2's config.json model_type is always the exact literal "kimi_k2" (unlike GLM's
- * family of names, this is a plain match, not a substring scan). This is the one string
- * comparison the K2 chat-template selection needs at every prompt-building site that has
- * a Cfg in scope -- no arch enum, per the Stage 2 scope decision. */
+/* Kimi-K2.6's config.json model_type is the exact literal "kimi_k2" (unlike GLM's
+ * family of names, this is a plain match, not a substring scan). */
 static int mt_is_k2(const Cfg *c){
     return c->model_type[0] && !strcmp(c->model_type, "kimi_k2");
-}
-
-/* Kimi-K2.6 shares K2-Thinking's EXACT model_type ("kimi_k2") once its container has
- * been through the converter's flatten step: the source repo's distinguishing outer
- * model_type ("kimi_k25") is deliberately dropped, not merged, to avoid corrupting the
- * K2 template selectors (see convert_fp8_to_int4.flatten_container_config's docstring).
- * So model_type alone cannot tell the two apart at any prompt-building site.
- *
- * PRIMARY discriminator, string comparison only (no arch enum): Cfg.source_variant,
- * read from config.json's "_colibri_source_variant" key. The converter's
- * _write_config_file stamps this ("kimi_k25") only when it flattened a K2.6-style
- * nested source (convert_fp8_to_int4.py) -- a structural fact about which container
- * this is, checked first, decisive when present.
- *
- * FALLBACK, only consulted when source_variant is empty (a container converted before
- * this marker existed): rope_scaling.beta_fast, the one config value that measurably
- * and verifiably differs between the two REAL checkpoints -- confirmed directly
- * against both real converted/source configs, not a fixture artifact: K2-Thinking's
- * validated container's config.json has beta_fast=1.0 (== beta_slow,
- * so the YaRN correction range collapses to a single-point step -- zero blended
- * dimensions, see test_yarn_rope.c); K2.6's real source config.json
- * (text_config.rope_scaling.beta_fast) has beta_fast=32.0 (11 genuinely blended
- * dimensions, low=8/high=20 at K2.6's real qk_rope=64/theta=50000). Both
- * checkpoints share the same tokenizer family (identical bos/eos/pad/vocab_size),
- * so those cannot discriminate; beta_fast can, but it is a YaRN *tuning* value with
- * no semantic tie to template choice -- a future point release could change it for
- * unrelated reasons and silently flip the template if it were the sole discriminator.
- * The marker exists to remove exactly that residual risk; beta_fast stays only as a
- * documented fallback, never overriding the marker when one is present. */
-static int mt_is_k26(const Cfg *c){
-    if(!mt_is_k2(c)) return 0;
-    if(c->source_variant[0]) return !strcmp(c->source_variant, "kimi_k25");
-    return c->rope_beta_fast > 1.0f;
 }
 
 #endif /* SAMPLE_H */

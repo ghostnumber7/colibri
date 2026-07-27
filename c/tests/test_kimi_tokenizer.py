@@ -54,7 +54,7 @@ def test_special_tokens_are_included(tmp_path):
     """Self-contained unit test (no checkpoint dependency, no full vocab needed):
     asserts that entries in tokenizer_config.json's added_tokens_decoder make
     it into the generated tokenizer.json's added_tokens AND model.vocab, at
-    the exact ids the config specifies. This is what guards K2-Thinking's
+    the exact ids the config specifies. This is what guards Kimi's
     reasoning-only special tokens like <think>/</think> (ids 163606/163607)
     from silently being dropped or mis-numbered — the round-trip test above
     only checks the base BPE vocab/merges and would not catch this."""

@@ -183,9 +183,9 @@ _VISION_PREFIXES = ("vision_tower.", "mm_projector.")
 
 def strip_lm_prefix(name):
     """Strip K2.6's `language_model.` prefix, if present, so classify() sees the exact
-    same bare `model.layers...`/`lm_head.weight` names it always has for K2-Thinking
-    and GLM. A name without the prefix (K2-Thinking, GLM) passes through unchanged --
-    this is the byte-identical regression guard for those checkpoints."""
+    same bare `model.layers...`/`lm_head.weight` names it always has for GLM. A name
+    without the prefix passes through unchanged -- the byte-identical regression guard
+    for flat checkpoints."""
     return name[len(_LM_PREFIX):] if name.startswith(_LM_PREFIX) else name
 
 def vision_drop_category(name):
@@ -203,19 +203,13 @@ def flatten_container_config(cfg):
     """K2.6 nests the real text-backbone config under `text_config`, alongside a
     `vision_config` and a top-level model_type of "kimi_k25"/architectures naming the
     multimodal class. Emit `text_config` VERBATIM as the container's config.json --
-    carry NOTHING over from the top level. Measured (not reasoned): diffing K2-Thinking's
-    validated config.json (96 keys) against K2.6's text_config (95 keys) shows the only
-    deltas are torch_dtype->dtype, beta_fast 1.0->32.0, the vision regexes in
-    quantization_config.ignore, and transformers_version; bos/eos/pad_token_id are
-    already inside text_config with identical values, and text_config's own model_type
-    is already "kimi_k2". A merge like {**text_config, **cfg} would restore the TOP
-    level's model_type ("kimi_k25"), and both chat-template selectors compare EXACTLY to
-    "kimi_k2" -- so it would silently fall back to GLM's template and emit
-    `[gMASK]<sop>...` through a Kimi tokenizer. Fluent garbage, no error.
-    A flat config (K2-Thinking, GLM: no `text_config` key) passes through unchanged --
-    this is the byte-identical regression guard for those checkpoints; callers should
-    keep using the original bytes (shutil.copy) rather than round-tripping this dict
-    back through json.dump for the flat case, so formatting/key-order never drifts."""
+    carry NOTHING over from the top level: text_config already holds bos/eos/pad_token_id
+    and its own model_type "kimi_k2", while a merge like {**text_config, **cfg} would
+    restore the TOP level's model_type ("kimi_k25") and the chat-template selectors
+    compare EXACTLY to "kimi_k2" -- GLM's template through a Kimi tokenizer, fluent
+    garbage, no error. A flat config (GLM: no `text_config` key) passes through
+    unchanged; callers should keep using the original bytes (shutil.copy) rather than
+    round-tripping this dict through json.dump, so formatting/key-order never drifts."""
     if isinstance(cfg, dict) and isinstance(cfg.get("text_config"), dict):
         return cfg["text_config"]
     return cfg
@@ -234,11 +228,11 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     # caller passes it -- its layer_idx logic requires p[0]=="model" (a still-prefixed
     # name returns -1 for EVERY layer) and its embed/lm_head check is an exact string
     # match (silently reclassifies to the "q" fallback). idempotent: a name without the
-    # prefix (K2-Thinking, GLM) is returned unchanged.
+    # prefix (GLM) is returned unchanged.
     name = strip_lm_prefix(name)
     if name.endswith("_scale_inv"): return "consumed"   # FP8 base: gestito col suo peso
-    # NVFP4 (modelopt): i sidecar delle scale sono consumati insieme al loro U8 .weight.
-    # EN: NVFP4 (modelopt): scale sidecars are consumed together with their U8 .weight.
+    # Sidecar delle scale, consumati insieme al loro peso: .weight_scale/.weight_scale_2/
+    # .input_scale (NVFP4 modelopt) e .weight_shape (compressed-tensors pack-quantized).
     if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".weight_shape")): return "consumed"
     li = layer_idx(name)
     if keep_idx:
@@ -704,54 +698,26 @@ def check_or_record_params(outdir, prefix, params):
 def _bits(v):                                   # "e8" -> fmt=6 marker; anything else an int width
     return E8 if v == E8 else int(v)
 
-SOURCE_VARIANT_MARKER = "_colibri_source_variant"
-KIMI_K25_SOURCE_VARIANT = "kimi_k25"
-
 def _write_config_file(src_path, dest_path):
     """Copy config.json from src_path to dest_path, flattening a K2.6-style nested
-    config (see flatten_container_config) on the way through. Flat configs (GLM,
-    K2-Thinking: no `text_config` key, or an unparseable/malformed file) are copied
-    byte-for-byte via shutil.copy, UNCHANGED from before this function existed -- so
-    those containers stay byte-identical; only a genuinely nested config gets
-    rewritten, and only into `text_config`'s own bytes reserialized (nothing merged
-    in from the top level).
-
-    Nested (K2.6) configs additionally get one new top-level key stamped on:
-    `_colibri_source_variant: "kimi_k25"`. The alternative discriminator --
-    rope_scaling.beta_fast (1.0 vs 32.0), as used by c/coli's is_k26_of and
-    c/openai_server.py's detect_k26 -- is a YaRN *tuning* value with no semantic tie to
-    template selection: a future Kimi point release could change it for unrelated reasons
-    and silently flip a container into the wrong template (fluent garbage, no error). The
-    marker is a structural fact about which container this is, recorded once, here, at the
-    only point the converter actually knows it flattened a nested source.
-
-    Built as a NEW dict (`{**flat, marker: ...}`), not by mutating `flat` in place: `flat`
-    IS `cfg["text_config"]` by identity (flatten_container_config's own verbatim/identity
-    contract, pinned by test_flatten_container_config_emits_text_config_verbatim), and
-    mutating a dict a caller might still hold a reference to is exactly the kind of hidden
-    side effect immutable-update patterns exist to avoid. Adding a sibling key changes
-    neither that identity contract nor any existing key's value -- confirmed by re-reading
-    the pinning test, which asserts identity and specific key values, never "no other keys
-    were added" -- so this does not reopen the "emit text_config verbatim" promise."""
+    config (see flatten_container_config) on the way through. Flat configs (GLM: no
+    `text_config` key, or an unparseable/malformed file) are copied byte-for-byte via
+    shutil.copy; only a genuinely nested config gets rewritten, and only into
+    `text_config`'s own bytes reserialized (nothing merged in from the top level)."""
     try:
         cfg = json.loads(open(src_path).read())
     except (OSError, ValueError):
         cfg = None
     # isinstance(...dict), not `"text_config" in cfg`: key-presence alone was true for
     # `"text_config": null`, which sent a non-dict through flatten and wrote the literal
-    # `null` into the container's config.json, destroying the output config (recoverable
-    # only by re-converting). Requiring a dict makes that input fall through to the
-    # byte-for-byte shutil.copy below instead -- nothing is lost, and the engine then
-    # fails loudly on the unflattened config rather than on a `null` one. This also makes
-    # the guard agree with c/coli:171 and c/openai_server.py:2224, which already used
-    # isinstance. flatten_container_config applies the same test, so `flat` is
-    # necessarily a dict here and needs no defensive ternary.
+    # `null` into the container's config.json, destroying the output config. A non-dict
+    # text_config falls through to the byte-for-byte shutil.copy below instead, and the
+    # engine then fails loudly on the unflattened config rather than on a `null` one.
     if isinstance(cfg, dict) and isinstance(cfg.get("text_config"), dict):
         flat = flatten_container_config(cfg)
-        out_cfg = {**flat, SOURCE_VARIANT_MARKER: KIMI_K25_SOURCE_VARIANT}
         tmp = dest_path + ".tmp"
         with open(tmp, "w") as out:
-            json.dump(out_cfg, out, indent=2)
+            json.dump(flat, out, indent=2)
         os.replace(tmp, dest_path)
     else:
         shutil.copy(src_path, dest_path)
@@ -803,13 +769,50 @@ def _write_metadata(src_dir, outdir):
         print(f"[META] WARNING: not found in {src_dir}: {', '.join(missing)}"
               + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
 
+def _source_is_pack_quantized(a):
+    """Best-effort peek at the source config.json. --indir reads it in place; --repo
+    reads the copy a previous/resumed run left in <outdir>/_meta or <outdir>, else
+    downloads it there -- the same file the conversion's own metadata step needs, so
+    nothing is fetched twice (hf_hub_download reuses local_dir). Any failure returns
+    False: fp8 sources (GLM) never needed the peek."""
+    if a.indir:      dirs = (a.indir,)
+    elif a.outdir:   dirs = (os.path.join(a.outdir, "_meta"), a.outdir)
+    else:            dirs = ()
+    for d in dirs:
+        try:
+            cfg = flatten_container_config(json.loads(open(os.path.join(d, "config.json")).read()))
+            return cfg.get("quantization_config", {}).get("format") == "pack-quantized"
+        except (OSError, ValueError, AttributeError):
+            continue
+    if a.repo and a.outdir:
+        try:
+            from huggingface_hub import hf_hub_download
+            meta_dir = os.path.join(a.outdir, "_meta"); os.makedirs(meta_dir, exist_ok=True)
+            hf_hub_download(a.repo, "config.json", local_dir=meta_dir)
+            cfg = flatten_container_config(json.loads(open(os.path.join(meta_dir, "config.json")).read()))
+            return cfg.get("quantization_config", {}).get("format") == "pack-quantized"
+        except Exception:
+            return False
+    return False
+
+def _resolve_default_ebits(a):
+    """Resident-tensor bits when --ebits is not given, decided by the checkpoint:
+      - pack-quantized sources (Kimi-K2.6 compressed-tensors): 8. The residents ship
+        bf16/int8 and must stay lossless -- int4 here is the over-quantization
+        regression this replaced (--arch-gated defaults).
+      - fp8 sources (GLM): 4 for the main pass, 8 for --mtp/--indexer (int4 drafts =
+        ~0% acceptance, issue #8) -- the historical defaults, unchanged."""
+    if a.mtp or a.indexer or _source_is_pack_quantized(a):
+        return 8
+    return 4
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=None)
     ap.add_argument("--indir", default=None)
     ap.add_argument("--outdir", required=False)
-    ap.add_argument("--ebits", type=int, default=8)      # bit residenti: default LOSSLESS int8
-                                                          # (GLM's `coli convert` passes --ebits 4 explicitly)
+    ap.add_argument("--ebits", type=int, default=None)   # bit residenti; default risolto dalla
+                                                          # sorgente (vedi _resolve_default_ebits)
     ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
     ap.add_argument("--xbits", type=_bits, default=None) # bit degli expert ROUTED (streaming), o "e8" (fmt=6); default=ebits
     # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
@@ -902,12 +905,12 @@ def main():
         print("[compressed-int4] synthetic pack->unpack round-trip: OK")
         return
 
-    # --ebits now defaults to 8 (LOSSLESS) via argparse itself -- no arch-keyed
-    # resolution needed here anymore. testa MTP a int4 = acceptance ~0-4% (misurato,
-    # issue #8): il draft sbaglia sempre e la speculazione non parte mai. A int8:
-    # 39-59%, 2.2-2.8 token/forward -- the lossless default already covers --mtp and
-    # --indexer too, so this WARNING only fires when a caller EXPLICITLY lowers
-    # --ebits below 8 alongside --mtp.
+    if a.ebits is None:
+        a.ebits = _resolve_default_ebits(a)
+
+    # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
+    # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward. This
+    # WARNING only fires when a caller EXPLICITLY lowers --ebits below 8 alongside --mtp.
     if a.mtp and a.ebits < 8 and a.group_size <= 0:
         # Non solo lossy: eh_proj ha ~20-30x di asimmetria di scala fra le due meta' di
         # colonna, quindi l'int4 per-riga (UNA scala per riga) arrotonda a ZERO l'intera

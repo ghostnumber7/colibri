@@ -345,13 +345,11 @@ class MessagesHTTPTest(unittest.TestCase):
         self.assertNotIn("[gMASK]<sop>", prompt)
         self.assertNotIn("<|user|>", prompt)
 
-    def test_dispatches_k26_renderer_via_is_k26_global(self):
-        """Same gap as test_dispatches_kimi_k2_renderer_not_glm, one layer deeper: ARCH==
-        "kimi_k2" alone can't distinguish K2.6 from K2-Thinking (both report that model_type
-        once converted) -- IS_K26 must be threaded through this dispatch too, exactly like
-        chat_completion's OpenAI-endpoint dispatch. No `thinking` field in the request body
-        -> enable_thinking defaults False -> K2.6's nothink marker."""
-        with patch("openai_server.ARCH", "kimi_k2"), patch("openai_server.IS_K26", True):
+    def test_dispatches_k2_renderer_via_arch(self):
+        """ARCH=="kimi_k2" routes /v1/messages through render_chat_k2, exactly like
+        chat_completion's OpenAI-endpoint dispatch. No `thinking` field in the request
+        body -> enable_thinking defaults False -> the nothink marker."""
+        with patch("openai_server.ARCH", "kimi_k2"):
             with self.post(self.base_body()) as response:
                 json.load(response)
         prompt = self.engine.prompts[-1]
@@ -360,8 +358,8 @@ class MessagesHTTPTest(unittest.TestCase):
             "<|im_assistant|>assistant<|im_middle|><think></think>")
         self.assertNotIn("You are Kimi", prompt)
 
-    def test_dispatches_k26_renderer_thinking_enabled(self):
-        with patch("openai_server.ARCH", "kimi_k2"), patch("openai_server.IS_K26", True):
+    def test_dispatches_k2_renderer_thinking_enabled(self):
+        with patch("openai_server.ARCH", "kimi_k2"):
             with self.post(self.base_body(thinking={"type": "enabled"})) as response:
                 json.load(response)
         prompt = self.engine.prompts[-1]

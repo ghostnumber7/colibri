@@ -516,10 +516,10 @@ endif
 
 test-python:
 ifneq ($(HAVE_PYTEST),yes)
-	@echo "WARNING: pytest not importable -- falling back to 'unittest discover',"
-	@echo "WARNING: which does not collect the bare-pytest-function suites"
-	@echo "WARNING: (tests/test_kimi_convert.py, tests/test_kimi_tokenizer.py)."
-	@echo "WARNING: install deps with: pip install -r tools/test-requirements.txt"
+	@echo "WARNING: pytest not importable in $(TEST_PYTHON) -- falling back to"
+	@echo "WARNING: 'unittest discover', which skips the bare-pytest-function suites and"
+	@echo "WARNING: still FAILS OUTRIGHT if numpy/torch are missing (module-scope imports)."
+	@echo "WARNING: install the test deps first: pip install -r tools/test-requirements.txt"
 endif
 	$(TEST_CMD)
 

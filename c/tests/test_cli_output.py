@@ -100,8 +100,8 @@ class ModelTypeOfTest(unittest.TestCase):
 
 
 class FlattenConfigTest(unittest.TestCase):
-    """flatten_config: the single shared accessor every c/coli config.json reader
-    (model_type_of, cmd_info, _convert_features) funnels through, so a K2.6-shaped
+    """flatten_config: the shared accessor every c/coli config.json reader
+    (model_type_of, cmd_info, cmd_convert) funnels through, so a K2.6-shaped
     nested config and an already-flat config report identical values."""
 
     def test_nested_returns_text_config_object(self):
@@ -121,151 +121,18 @@ class FlattenConfigTest(unittest.TestCase):
         self.assertEqual(coli.flatten_config(None), None)
 
 
-class IsK26OfTest(unittest.TestCase):
-    """is_k26_of: the K2.6-vs-K2-Thinking discriminator, since both report the identical
-    model_type "kimi_k2" once converted. Verified against both REAL checkpoints'
-    config.json (K2-Thinking: beta_fast=1.0; K2.6: beta_fast=32.0), not assumed."""
-
-    def test_k26_shaped_config_beta_fast_32(self):
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k2",
-                "rope_scaling": {"type": "yarn", "beta_fast": 32.0, "beta_slow": 1.0},
-            }))
-            self.assertTrue(coli.is_k26_of(model))
-
-    def test_k2_thinking_shaped_config_beta_fast_1_is_not_k26(self):
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k2",
-                "rope_scaling": {"type": "yarn", "beta_fast": 1.0, "beta_slow": 1.0},
-            }))
-            self.assertFalse(coli.is_k26_of(model))
-
-    def test_no_rope_scaling_at_all_is_not_k26(self):
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
-            self.assertFalse(coli.is_k26_of(model))
-
-    def test_reads_through_nested_text_config(self):
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k25",
-                "text_config": {"model_type": "kimi_k2",
-                               "rope_scaling": {"type": "yarn", "beta_fast": 32.0}},
-            }))
-            self.assertTrue(coli.is_k26_of(model))
-
-    def test_missing_config_fails_soft_to_false(self):
-        with tempfile.TemporaryDirectory() as model:
-            self.assertFalse(coli.is_k26_of(model))
-
-    def test_malformed_config_fails_soft_to_false(self):
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text("not json")
-            self.assertFalse(coli.is_k26_of(model))
-
-    def test_marker_wins_over_beta_fast_1_fallback(self):
-        """rope_scaling.beta_fast is a YaRN tuning value with no semantic tie
-        to template choice. The converter now stamps an explicit top-level
-        `_colibri_source_variant: "kimi_k25"` marker; it must decide the answer even when
-        beta_fast alone would say the opposite (K2-Thinking's beta_fast=1.0 here)."""
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k2", "_colibri_source_variant": "kimi_k25",
-                "rope_scaling": {"type": "yarn", "beta_fast": 1.0, "beta_slow": 1.0},
-            }))
-            self.assertTrue(coli.is_k26_of(model))
-
-    def test_marker_present_but_wrong_value_is_decisive_not_k26(self):
-        """A marker present but not "kimi_k25" is decisive as "not K2.6" -- only an
-        ABSENT marker falls through to the beta_fast fallback, not merely a mismatch."""
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k2", "_colibri_source_variant": "something_else",
-                "rope_scaling": {"type": "yarn", "beta_fast": 32.0, "beta_slow": 1.0},
-            }))
-            self.assertFalse(coli.is_k26_of(model))
-
-    def test_no_marker_falls_back_to_beta_fast(self):
-        """Regression guard: containers converted before the marker existed have no such
-        key and must keep working via the beta_fast fallback, unchanged."""
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k2",
-                "rope_scaling": {"type": "yarn", "beta_fast": 32.0, "beta_slow": 1.0},
-            }))
-            self.assertTrue(coli.is_k26_of(model))
-
-
-class ConvertFeaturesTest(unittest.TestCase):
-    """_convert_features: drives --ebits/1-vs-2-pass for `coli convert`. K2.6's source
-    config nests both num_nextn_predict_layers and quantization_config inside
-    text_config -- read flat (pre-Task-2 behavior), pack_quantized silently comes out
-    False, forcing --ebits 4 onto resident tensors that must stay int8 (the same
-    regression this branch already root-caused and fixed once for K2-Thinking)."""
-
-    def _features(self, indir):
-        import argparse
-        return coli._convert_features(argparse.Namespace(indir=str(indir), repo=None))
-
-    def test_k26_nested_config_reports_pack_quantized_true(self):
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k25",
-                "text_config": {
-                    "model_type": "kimi_k2",
-                    "num_nextn_predict_layers": 0,
-                    "quantization_config": {"format": "pack-quantized"},
-                },
-            }))
-            has_mtp, pack_quantized = self._features(model)
-            self.assertFalse(has_mtp)
-            self.assertTrue(pack_quantized)
-
-    def test_k2_thinking_flat_config_unchanged(self):
-        """Regression guard: the flat (already-working) K2-Thinking shape must keep
-        reporting exactly what it did before flatten_config existed."""
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "kimi_k2",
-                "num_nextn_predict_layers": 0,
-                "quantization_config": {"format": "pack-quantized"},
-            }))
-            has_mtp, pack_quantized = self._features(model)
-            self.assertFalse(has_mtp)
-            self.assertTrue(pack_quantized)
-
-    def test_glm_flat_config_unchanged(self):
-        with tempfile.TemporaryDirectory() as model:
-            (Path(model) / "config.json").write_text(json.dumps({
-                "model_type": "glm_moe_dsa", "num_nextn_predict_layers": 1,
-            }))
-            has_mtp, pack_quantized = self._features(model)
-            self.assertTrue(has_mtp)
-            self.assertFalse(pack_quantized)
-
-    def test_missing_config_fails_soft_to_glm_safe_default(self):
-        with tempfile.TemporaryDirectory() as model:
-            has_mtp, pack_quantized = self._features(model)
-            self.assertTrue(has_mtp)
-            self.assertFalse(pack_quantized)
-
-
 class BuildRunPromptTest(unittest.TestCase):
     """coli:cmd_run builds this exact string and hands it to the engine via $PROMPT.
-    K2 has neither [gMASK] nor <sop>: the engine already no-ops an unresolvable prefix
-    (tok_id_of returns -1), but the launcher used to inject the literal GLM characters as
-    text, which BPE-encodes into token sequences the model never saw."""
+    kimi_k2 means Kimi-K2.6; the template is pinned byte-exact against the checkpoint's
+    own chat_template.jinja rendered through transformers' Jinja2 env."""
 
     def test_kimi_k2_template_is_exact(self):
+        """K2.6: no [gMASK]/<sop>, no system preamble, nothink marker by default."""
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(
                 coli.build_run_prompt("kimi_k2", "hello"),
-                "<|im_system|>system<|im_middle|>"
-                "You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>"
                 "<|im_user|>user<|im_middle|>hello<|im_end|>"
-                "<|im_assistant|>assistant<|im_middle|>",
+                "<|im_assistant|>assistant<|im_middle|><think></think>",
             )
 
     def test_glm_template_is_unchanged(self):
@@ -276,10 +143,8 @@ class BuildRunPromptTest(unittest.TestCase):
                 "[gMASK]<sop><|user|>hello<|assistant|><think></think>",
             )
 
-    def test_think_env_affects_only_glm(self):
-        """K2's generation prompt has NO <think> marker at all -- K2-Thinking opens one (or
-        not) on its own, unlike GLM's <think></think>-means-nothink convention. THINK=1 must
-        not add anything to the K2 string."""
+    def test_think_env_opens_think_marker_for_glm_and_kimi(self):
+        """THINK=1 leaves <think> open; K2.6 follows GLM's THINK-env convention."""
         with mock.patch.dict("os.environ", {"THINK": "1"}, clear=True):
             self.assertEqual(
                 coli.build_run_prompt("glm_moe_dsa", "hello"),
@@ -287,10 +152,8 @@ class BuildRunPromptTest(unittest.TestCase):
             )
             self.assertEqual(
                 coli.build_run_prompt("kimi_k2", "hello"),
-                "<|im_system|>system<|im_middle|>"
-                "You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>"
                 "<|im_user|>user<|im_middle|>hello<|im_end|>"
-                "<|im_assistant|>assistant<|im_middle|>",
+                "<|im_assistant|>assistant<|im_middle|><think>",
             )
 
     def test_unknown_model_type_falls_back_to_glm(self):
@@ -300,50 +163,10 @@ class BuildRunPromptTest(unittest.TestCase):
                 "[gMASK]<sop><|user|>hello<|assistant|><think></think>",
             )
 
-    def test_k26_no_default_preamble_nothink(self):
-        """Byte-exact match against Kimi-K2.6's REAL chat_template.jinja, rendered through
-        transformers' Jinja2 env. Unlike K2-Thinking, is_k26=True gets NO default system
-        preamble at all, and ALWAYS a think marker in the generation prompt."""
-        with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(
-                coli.build_run_prompt("kimi_k2", "hello", is_k26=True),
-                "<|im_user|>user<|im_middle|>hello<|im_end|>"
-                "<|im_assistant|>assistant<|im_middle|><think></think>",
-            )
-
-    def test_k26_think_env_opens_think_marker(self):
-        """K2.6 DOES use THINK, exactly GLM's convention -- unlike K2-Thinking, which
-        ignores it entirely (see test_think_env_affects_only_glm)."""
-        with mock.patch.dict("os.environ", {"THINK": "1"}, clear=True):
-            self.assertEqual(
-                coli.build_run_prompt("kimi_k2", "hello", is_k26=True),
-                "<|im_user|>user<|im_middle|>hello<|im_end|>"
-                "<|im_assistant|>assistant<|im_middle|><think>",
-            )
-
-    def test_k26_default_is_k26_false_is_k2_thinking_regression(self):
-        """is_k26 defaults to False so every OLD call/test that only passes (mt, prompt)
-        keeps K2-Thinking's exact byte-for-byte behavior -- this is the regression guard
-        for that default."""
-        with mock.patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(
-                coli.build_run_prompt("kimi_k2", "hello"),
-                coli.build_run_prompt("kimi_k2", "hello", is_k26=False),
-            )
-
 
 class CmdServeTest(unittest.TestCase):
-    """cmd_serve had zero coverage before these tests -- which is exactly how a
-    regression slipped through: c/coli's cmd_serve calls openai_server.detect_arch(a.model)
-    unguarded, and detect_arch used to catch only OSError. A syntactically-invalid
-    config.json (with a valid tokenizer.json, so need_model passes) raised an uncaught
-    json.JSONDecodeError, which (a) crashed `coli serve` where it previously started
-    (wrongly, with GLM's template), and (b) landed after the pidfile write but before the
-    try/finally that removes it, orphaning a stale pidfile. Fixed two ways: detect_arch now
-    catches json.JSONDecodeError too (matching detect_k26, which already did), AND
-    cmd_serve's try/finally was widened to cover the detect_arch/detect_k26 calls
-    themselves, not just serve() -- so the pidfile can't be orphaned by any exception
-    there, not only the one kind reproduced here."""
+    """cmd_serve wiring: detect_arch sets openai_server.ARCH, fail-soft on a bad
+    config.json, and the pidfile try/finally covers the detect_arch call itself."""
 
     def _args(self, model, port):
         return argparse.Namespace(
@@ -373,10 +196,24 @@ class CmdServeTest(unittest.TestCase):
                              "serve() should still run (fail-soft glm arch), not crash")
             self.assertFalse(os.path.exists(pidfile), "pidfile must not be orphaned")
 
+    def test_serve_wires_arch_from_model_config(self):
+        """cmd_serve must set openai_server.ARCH via detect_arch before serve() runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self._model_dir(tmp, json.dumps({"model_type": "kimi_k2"}))
+            pidfile = coli.serve_pidfile(19736)
+            self.addCleanup(lambda: os.path.exists(pidfile) and os.unlink(pidfile))
+            original_arch = openai_server.ARCH
+            self.addCleanup(lambda: setattr(openai_server, "ARCH", original_arch))
+            seen = {}
+            with mock.patch.object(coli, "GLM", __file__), \
+                 mock.patch.object(openai_server, "serve",
+                                   side_effect=lambda *a, **k: seen.setdefault("arch", openai_server.ARCH)):
+                coli.cmd_serve(self._args(model, 19736))
+            self.assertEqual(seen.get("arch"), "kimi_k2")
+
     def test_unexpected_exception_in_detect_arch_still_cleans_up_pidfile(self):
-        """Defense in depth, independent of which exception type triggered the review:
-        the try/finally now wraps the whole detect+serve sequence, so even an exception
-        type neither detect_arch nor detect_k26 catches today cannot orphan the pidfile."""
+        """The try/finally wraps the whole detect+serve sequence, so even an exception
+        type detect_arch doesn't catch today cannot orphan the pidfile."""
         with tempfile.TemporaryDirectory() as tmp:
             model = self._model_dir(tmp, json.dumps({"model_type": "glm_moe_dsa"}))
             pidfile = coli.serve_pidfile(19735)

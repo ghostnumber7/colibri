@@ -332,18 +332,15 @@ def test_flatten_container_config_emits_text_config_verbatim():
 
 
 def test_flatten_container_config_flat_passthrough_unchanged():
-    """K2-Thinking/GLM-style flat config (no text_config key) must pass through as
-    the exact same object -- the byte-identical regression guard for those checkpoints."""
+    """A GLM-style flat config (no text_config key) must pass through as the exact
+    same object -- the byte-identical regression guard for flat checkpoints."""
     flat_cfg = {"model_type": "kimi_k2", "num_hidden_layers": 61, "rope_theta": 50000.0}
     assert cvt.flatten_container_config(flat_cfg) is flat_cfg
 
 
 def test_write_metadata_flattens_nested_k26_config(tmp_path):
-    """End-to-end through _write_metadata (the actual output path), not just the pure
-    helper: a K2.6-style nested config.json on disk must be written to outdir/config.json
-    as text_config's content, plus the review-round _colibri_source_variant marker (see
-    test_write_config_file_stamps_source_variant_marker below for the marker itself,
-    pinned in isolation)."""
+    """A K2.6-style nested config.json is written to outdir/config.json as text_config's
+    content VERBATIM -- nothing added, nothing merged from the top level."""
     src = tmp_path / "src"; src.mkdir()
     out = tmp_path / "out"; out.mkdir()
     (src / "config.json").write_text(json.dumps(K26_NESTED_CONFIG))
@@ -351,56 +348,17 @@ def test_write_metadata_flattens_nested_k26_config(tmp_path):
     got = json.loads((out / "config.json").read_text())
     assert got["model_type"] == "kimi_k2"
     assert "text_config" not in got and "vision_config" not in got
-    assert got[cvt.SOURCE_VARIANT_MARKER] == cvt.KIMI_K25_SOURCE_VARIANT
-    got_without_marker = {k: v for k, v in got.items() if k != cvt.SOURCE_VARIANT_MARKER}
-    assert got_without_marker == K26_TEXT_CONFIG
+    assert got == K26_TEXT_CONFIG
 
 
-def test_write_config_file_stamps_source_variant_marker(tmp_path):
-    """rope_scaling.beta_fast (the discriminator c/coli and
-    c/openai_server.py used) is a YaRN *tuning* value with no semantic tie to template
-    choice -- a future Kimi point release could change it for unrelated reasons and
-    silently flip a container into the wrong template. The converter now stamps an
-    explicit, structural marker instead, at the one point it actually knows it flattened
-    a nested source: _write_config_file."""
-    src = tmp_path / "src"; src.mkdir()
-    out = tmp_path / "out"
-    (src / "config.json").write_text(json.dumps(K26_NESTED_CONFIG))
-    cvt._write_config_file(str(src / "config.json"), str(out))
-    got = json.loads(out.read_text())
-    assert got["_colibri_source_variant"] == "kimi_k25"
-
-
-def test_write_config_file_does_not_mutate_shared_text_config_object(tmp_path):
-    """The marker must be added via a NEW dict, not by mutating flatten_container_config's
-    return value in place: that value IS cfg["text_config"] by identity (the verbatim
-    contract), and mutating a dict a caller might still hold a reference to is exactly the
-    hidden side effect immutable-update patterns exist to avoid."""
-    src = tmp_path / "src"; src.mkdir()
-    out = tmp_path / "out"
-    nested = json.loads(json.dumps(K26_NESTED_CONFIG))  # fresh, independent copy
-    (src / "config.json").write_text(json.dumps(nested))
-    flat_before = cvt.flatten_container_config(nested)
-    assert "_colibri_source_variant" not in flat_before
-    cvt._write_config_file(str(src / "config.json"), str(out))
-    # The in-memory nested dict (and its text_config sub-object) must be untouched --
-    # _write_config_file re-reads config.json from disk itself, so this also proves it
-    # didn't reach back into a caller-held object.
-    assert "_colibri_source_variant" not in nested["text_config"]
-    assert "_colibri_source_variant" not in flat_before
-
-
-def test_write_config_file_flat_config_gets_no_marker(tmp_path):
-    """K2-Thinking/GLM regression: a flat config (no text_config key) takes the
-    byte-for-byte shutil.copy path, unaffected by the marker entirely -- absence of the
-    marker must keep meaning "not K2.6" for these containers, unchanged."""
+def test_write_config_file_flat_config_copied_byte_for_byte(tmp_path):
+    """Flat config (no text_config key): the byte-for-byte shutil.copy path, unchanged."""
     src = tmp_path / "src"; src.mkdir()
     out = tmp_path / "out"
     raw = json.dumps({"model_type": "kimi_k2", "num_hidden_layers": 61})
     (src / "config.json").write_text(raw)
     cvt._write_config_file(str(src / "config.json"), str(out))
     assert out.read_text() == raw
-    assert "_colibri_source_variant" not in json.loads(out.read_text())
 
 
 def test_write_config_file_null_text_config_is_not_flattened(tmp_path):
@@ -429,7 +387,7 @@ def test_flatten_container_config_null_text_config_passes_through(tmp_path):
 
 
 def test_write_metadata_flat_config_byte_identical(tmp_path):
-    """K2-Thinking/GLM regression: a flat config.json (no text_config) must be copied
+    """Flat-config (GLM) regression: a flat config.json (no text_config) must be copied
     through BYTE-FOR-BYTE (shutil.copy), not round-tripped through json.dump -- which
     could silently reorder keys or change whitespace even when the data is equal."""
     src = tmp_path / "src"; src.mkdir()
@@ -454,7 +412,7 @@ def test_read_n_layers_from_config_nested_k26(tmp_path):
 
 
 def test_classify_rejects_stray_weight_packed():
-    """K2-Thinking only int4-quantizes routed experts (config `ignore` keeps
+    """Kimi K2 checkpoints only int4-quantize routed experts (config `ignore` keeps
     shared_experts/attention/dense-mlp/lm_head in bf16), so a `.weight_packed`
     tensor should only ever appear under `.mlp.experts.`. A stray one elsewhere
     must fail loud, not silently fall through to f32 and get misread as raw
@@ -613,14 +571,21 @@ def test_write_metadata_copies_existing_tokenizer_not_regenerated(tmp_path, caps
     assert got == {"marker": "source-tokenizer"}, "existing tokenizer.json must be copied verbatim, not regenerated"
 
 
-def test_ebits_default_resolves_to_8(tmp_path):
-    """Bit defaults = lossless: with no --ebits flag at all, the converter's resolved
-    default must be 8 (int8), not the old 4 -- callers that want GLM's old streaming
-    bits (e.g. `coli convert`'s GLM path) now lower it explicitly to --ebits 4."""
-    indir = tmp_path / "empty_src"; indir.mkdir()
-    outdir = tmp_path / "empty_out"
+def test_ebits_default_resolves_from_source(tmp_path):
+    """No --ebits: the converter resolves the default from the source config.json --
+    4 for a plain/fp8 source (GLM's historical int4), 8 for a pack-quantized one."""
+    plain = tmp_path / "plain_src"; plain.mkdir()
     r = subprocess.run([sys.executable, os.path.join(TOOLS, "convert_fp8_to_int4.py"),
-                        "--indir", str(indir), "--outdir", str(outdir)],
+                        "--indir", str(plain), "--outdir", str(tmp_path / "plain_out")],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "experts 4-bit" in r.stdout, r.stdout
+
+    k26 = tmp_path / "k26_src"; k26.mkdir()
+    (k26 / "config.json").write_text(json.dumps(
+        {"num_hidden_layers": 2, "quantization_config": {"format": "pack-quantized"}}))
+    r = subprocess.run([sys.executable, os.path.join(TOOLS, "convert_fp8_to_int4.py"),
+                        "--indir", str(k26), "--outdir", str(tmp_path / "k26_out")],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "experts 8-bit" in r.stdout, r.stdout
@@ -642,100 +607,187 @@ def _load_coli():
     return m
 
 
-def test_cmd_convert_pack_quantized_skips_mtp(monkeypatch):
-    """Regression: `coli convert` on a pack-quantized
-    checkpoint (e.g. K2) with no MTP head must (a) run a single pass with no MTP, and
-    (b) NOT force int4 residents via a hardcoded --ebits -- the launcher must omit
-    --ebits when the user didn't set it, so the converter's own lossless int8 default
-    applies."""
-    coli = _load_coli()
-    monkeypatch.setattr(coli, "_convert_features", lambda a: (False, True))  # has_mtp=False, pack_quantized=True
-    calls = []
-    monkeypatch.setattr(coli.subprocess, "call", lambda cmd, **k: (calls.append(cmd), 0)[1])
-    a = types.SimpleNamespace(repo="moonshotai/Kimi-K2-Thinking", model="/tmp/out",
-                              ebits=None, io_bits=8, xbits=0, group_size=64, no_mtp=False,
-                              indir=None, outdir=None)
-    # cmd_convert calls sys.exit; capture it
-    try:
-        coli.cmd_convert(a)
-    except SystemExit:
-        pass
-    assert len(calls) == 1, f"pack-quantized convert must be a single pass, got {len(calls)}"
-    joined = " ".join(calls[0])
-    assert "--mtp" not in joined
-    assert "--ebits 4" not in joined, "launcher must not force GLM's --ebits 4 on a pack-quantized checkpoint"
+def _convert_args(outdir, **over):
+    d = dict(repo="zai-org/GLM-5.2-FP8", model=str(outdir),
+             ebits=None, io_bits=8, xbits=0, group_size=64, no_mtp=False,
+             indir=None, outdir=None)
+    d.update(over)
+    return types.SimpleNamespace(**d)
 
 
-def test_cmd_convert_glm_runs_two_passes(monkeypatch):
-    """Regression: GLM's 2-pass flow (main model + int8 MTP head) must be unchanged
-    now that the entry condition is `not pack_quantized` + `has_mtp` instead of an
-    --arch name."""
-    coli = _load_coli()
-    monkeypatch.setattr(coli, "_convert_features", lambda a: (True, False))  # has_mtp=True, pack_quantized=False
+def _run_cmd_convert(coli, monkeypatch, a):
+    """Run cmd_convert with subprocess.call mocked; return (recorded calls, exit code)."""
     calls = []
     monkeypatch.setattr(coli.subprocess, "call", lambda cmd, **k: (calls.append(cmd), 0)[1])
-    a = types.SimpleNamespace(repo="zai-org/GLM-5.2-FP8", model="/tmp/out",
-                              ebits=None, io_bits=8, xbits=0, group_size=64, no_mtp=False,
-                              indir=None, outdir=None)
-    try:
+    with pytest.raises(SystemExit) as e:
         coli.cmd_convert(a)
-    except SystemExit:
-        pass
+    return calls, e.value.code
+
+
+def test_cmd_convert_no_mtp_in_outdir_config_single_pass_no_ebits(monkeypatch, tmp_path):
+    """K2.6 flow: pass 1 writes config.json into outdir; num_nextn_predict_layers=0
+    (read through flatten_config, nested here) stops after one pass. --ebits is omitted
+    entirely when the user didn't set it -- the converter resolves its own default."""
+    coli = _load_coli()
+    out = tmp_path / "out"; out.mkdir()
+    (out / "config.json").write_text(json.dumps(
+        {"model_type": "kimi_k25",
+         "text_config": {"model_type": "kimi_k2", "num_nextn_predict_layers": 0}}))
+    calls, code = _run_cmd_convert(coli, monkeypatch, _convert_args(out))
+    assert code == 0
+    assert len(calls) == 1, f"no-MTP convert must be a single pass, got {len(calls)}"
+    assert "--ebits" not in calls[0], "launcher must not inject --ebits unless the user set it"
+    assert "--mtp" not in calls[0]
+
+
+def test_cmd_convert_mtp_in_outdir_config_runs_two_passes(monkeypatch, tmp_path):
+    """GLM flow: outdir config with num_nextn_predict_layers>0 triggers the MTP pass,
+    which forces --ebits 8; the main pass still carries no injected --ebits."""
+    coli = _load_coli()
+    out = tmp_path / "out"; out.mkdir()
+    (out / "config.json").write_text(json.dumps(
+        {"model_type": "glm_moe_dsa", "num_nextn_predict_layers": 1}))
+    calls, code = _run_cmd_convert(coli, monkeypatch, _convert_args(out))
+    assert code == 0
     assert len(calls) == 2, f"glm convert must be two passes, got {len(calls)}"
-    joined0 = " ".join(calls[0]); joined1 = " ".join(calls[1])
-    assert "--mtp" not in joined0
-    assert "--ebits 4" in joined0, "GLM main pass must force --ebits 4 (converter's own default is now lossless int8)"
-    assert "--mtp" in joined1
+    assert "--ebits" not in calls[0]
+    assert "--mtp" not in calls[0]
+    joined1 = " ".join(calls[1])
+    assert "--mtp" in calls[1]
     assert "--ebits 8" in joined1, "MTP pass must force int8 even with --ebits omitted from base"
 
 
-def test_convert_features_helper(monkeypatch, tmp_path):
-    """Unit-test _convert_features in isolation: --indir reads config.json off local
-    disk (no network call); --repo fetches it from the hub. Checks the same signature
-    as convert_fp8_to_int4.classify's caller: num_nextn_predict_layers > 0 -> has_mtp,
-    quantization_config.format == "pack-quantized" -> pack_quantized. Any read failure
-    falls back to the GLM-safe default (has_mtp=True, pack_quantized=False) -- this is
-    what keeps a network hiccup from silently routing a GLM repo down the K2 (no-MTP,
-    no-forced-ebits) path."""
+def test_cmd_convert_explicit_ebits_passed_through_and_raised_for_mtp(monkeypatch, tmp_path):
+    """--ebits set by the user is forwarded verbatim on pass 1 and raised to >=8 on the
+    MTP pass."""
     coli = _load_coli()
-    import json as _json
+    out = tmp_path / "out"; out.mkdir()
+    (out / "config.json").write_text(json.dumps({"num_nextn_predict_layers": 1}))
+    calls, code = _run_cmd_convert(coli, monkeypatch, _convert_args(out, ebits=6))
+    assert code == 0
+    assert len(calls) == 2
+    assert "--ebits 6" in " ".join(calls[0])
+    joined1 = " ".join(calls[1])
+    assert "--mtp" in calls[1] and "--ebits 8" in joined1
 
-    d = tmp_path / "local"; d.mkdir()
-    (d / "config.json").write_text(_json.dumps({
-        "model_type": "kimi_k2", "num_nextn_predict_layers": 0,
-        "quantization_config": {"format": "pack-quantized"}}))
-    a_indir = types.SimpleNamespace(indir=str(d), repo=None)
-    called = []
+
+def test_cmd_convert_missing_outdir_config_fails_soft_to_mtp_pass(monkeypatch, tmp_path):
+    """Unreadable outdir config.json -> has_mtp=True (GLM-safe): a failed read must
+    never silently skip GLM's MTP pass."""
+    coli = _load_coli()
+    out = tmp_path / "out"; out.mkdir()          # no config.json written
+    calls, code = _run_cmd_convert(coli, monkeypatch, _convert_args(out))
+    assert code == 0
+    assert len(calls) == 2, "fail-soft must keep GLM's two-pass flow"
+    assert "--mtp" in calls[1]
+
+
+def test_cmd_convert_no_mtp_flag_is_single_pass(monkeypatch, tmp_path):
+    """--no-mtp exits after pass 1 without even reading the outdir config."""
+    coli = _load_coli()
+    out = tmp_path / "out"; out.mkdir()          # no config.json needed
+    calls, code = _run_cmd_convert(coli, monkeypatch, _convert_args(out, no_mtp=True))
+    assert code == 0
+    assert len(calls) == 1
+    assert "--mtp" not in calls[0]
+
+
+def test_cmd_convert_feature_detection_uses_no_network(monkeypatch, tmp_path):
+    """The MTP decision reads <outdir>/config.json locally; any urllib call during
+    cmd_convert is a regression to the removed HF preflight."""
+    coli = _load_coli()
     import urllib.request
-    def _must_not_call(*a, **k):
-        called.append(1); raise AssertionError("must not fetch config.json for --indir")
-    monkeypatch.setattr(urllib.request, "urlopen", _must_not_call)
-    assert coli._convert_features(a_indir) == (False, True)
-    assert not called, "--indir must read config.json off local disk, not the network"
+    def _boom(*a, **k):
+        raise AssertionError("cmd_convert must not touch the network")
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    monkeypatch.setattr(urllib.request, "urlretrieve", _boom, raising=False)
+    out = tmp_path / "out"; out.mkdir()
+    (out / "config.json").write_text(json.dumps({"num_nextn_predict_layers": 0}))
+    calls, code = _run_cmd_convert(coli, monkeypatch,
+                                   _convert_args(out, repo="moonshotai/Kimi-K2.6"))
+    assert code == 0
+    assert len(calls) == 1
 
-    class _Resp:
-        def __init__(self, data): self._data = data
-        def read(self): return self._data
-        def __enter__(self): return self
-        def __exit__(self, *exc): return False
 
-    def _fake_urlopen(cfg):
-        def _f(*a, **k): return _Resp(_json.dumps(cfg).encode())
-        return _f
+# ---------- converter-side --ebits default resolution ----------
 
-    a_repo = types.SimpleNamespace(indir=None, repo="zai-org/GLM-5.2-FP8")
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen(
-        {"num_nextn_predict_layers": 1, "quantization_config": {"fmt": "e4m3"}}))
-    assert coli._convert_features(a_repo) == (True, False)
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen(
-        {"model_type": "kimi_k2", "num_nextn_predict_layers": 0,
-         "quantization_config": {"format": "pack-quantized"}}))
-    assert coli._convert_features(a_repo) == (False, True)
+def test_resolve_default_ebits_plain_source_is_4(tmp_path):
+    """fp8/plain source (no pack-quantized quantization_config): GLM's historical 4."""
+    d = tmp_path / "src"; d.mkdir()
+    (d / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
+    a = types.SimpleNamespace(mtp=False, indexer=False, indir=str(d), repo=None, outdir=None)
+    assert cvt._resolve_default_ebits(a) == 4
 
-    def _raise(*a, **k): raise OSError("network unreachable")
-    monkeypatch.setattr(urllib.request, "urlopen", _raise)
-    assert coli._convert_features(a_repo) == (True, False), "fetch failure must fall back GLM-safe, not raise"
+
+def test_resolve_default_ebits_mtp_or_indexer_is_8():
+    for over in ({"mtp": True, "indexer": False}, {"mtp": False, "indexer": True}):
+        a = types.SimpleNamespace(indir=None, repo=None, outdir=None, **over)
+        assert cvt._resolve_default_ebits(a) == 8
+
+
+def test_resolve_default_ebits_pack_quantized_source_is_8(tmp_path):
+    d = tmp_path / "src"; d.mkdir()
+    (d / "config.json").write_text(json.dumps(
+        {"quantization_config": {"format": "pack-quantized"}}))
+    a = types.SimpleNamespace(mtp=False, indexer=False, indir=str(d), repo=None, outdir=None)
+    assert cvt._resolve_default_ebits(a) == 8
+
+
+def test_source_is_pack_quantized_reads_indir_flat_and_nested(tmp_path):
+    flat = tmp_path / "flat"; flat.mkdir()
+    (flat / "config.json").write_text(json.dumps(
+        {"quantization_config": {"format": "pack-quantized"}}))
+    assert cvt._source_is_pack_quantized(
+        types.SimpleNamespace(indir=str(flat), repo=None, outdir=None)) is True
+    nested = tmp_path / "nested"; nested.mkdir()
+    (nested / "config.json").write_text(json.dumps(K26_NESTED_CONFIG))
+    assert cvt._source_is_pack_quantized(
+        types.SimpleNamespace(indir=str(nested), repo=None, outdir=None)) is True
+
+
+def test_source_is_pack_quantized_missing_or_malformed_is_false_without_network(tmp_path, monkeypatch):
+    """Missing, malformed, or quantization-free config -> False, no raise, no network."""
+    import urllib.request
+    def _boom(*a, **k):
+        raise AssertionError("no network allowed")
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.hf_hub_download = _boom
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    missing = tmp_path / "missing"; missing.mkdir()
+    assert cvt._source_is_pack_quantized(
+        types.SimpleNamespace(indir=str(missing), repo=None, outdir=None)) is False
+    bad = tmp_path / "bad"; bad.mkdir()
+    (bad / "config.json").write_text("not json")
+    assert cvt._source_is_pack_quantized(
+        types.SimpleNamespace(indir=str(bad), repo=None, outdir=None)) is False
+    fp8 = tmp_path / "fp8"; fp8.mkdir()
+    (fp8 / "config.json").write_text(json.dumps({"model_type": "glm_moe_dsa"}))
+    assert cvt._source_is_pack_quantized(
+        types.SimpleNamespace(indir=str(fp8), repo=None, outdir=None)) is False
+
+
+def test_source_is_pack_quantized_repo_mode_peeks_local_meta_then_outdir(tmp_path, monkeypatch):
+    """--repo mode reads the copy already on disk in <outdir>/_meta or <outdir> before
+    ever considering a download (hf_hub_download stubbed to fail loudly here)."""
+    def _boom(*a, **k):
+        raise AssertionError("must peek the local copy, not download")
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.hf_hub_download = _boom
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    pq = json.dumps({"quantization_config": {"format": "pack-quantized"}})
+    out_meta = tmp_path / "out_meta"; (out_meta / "_meta").mkdir(parents=True)
+    (out_meta / "_meta" / "config.json").write_text(pq)
+    assert cvt._source_is_pack_quantized(types.SimpleNamespace(
+        indir=None, repo="moonshotai/Kimi-K2.6", outdir=str(out_meta))) is True
+
+    out_root = tmp_path / "out_root"; out_root.mkdir()
+    (out_root / "config.json").write_text(pq)
+    assert cvt._source_is_pack_quantized(types.SimpleNamespace(
+        indir=None, repo="moonshotai/Kimi-K2.6", outdir=str(out_root))) is True
 
 
 # ---------- Parallel + memory-bounded --indir conversion (this task) ----------
