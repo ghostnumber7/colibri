@@ -5072,6 +5072,10 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
         else attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
         if(snapped) memcpy(x,tmp,(size_t)S*D*sizeof(float));   /* prefix_sum restarts at attn */
         else for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+        /* Same pilot window as the generic path below: predict layer li+1's experts
+         * while THIS layer's MoE loads/computes. x is the running prefix, not the
+         * mixer-corrected MLP input — the pilot is a predictor, recall > exactness. */
+        if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
         k3_apply_attn_res(c,x,g_k3_bres,g_k3_nb,S,l->res_mlp_norm,l->res_mlp_proj,h);
         for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, h+(int64_t)s*D, l->post_ln, D, c->eps);
         if(l->sparse) moe(m,l,li,nrm,S,tmp,1); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
