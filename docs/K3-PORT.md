@@ -1,7 +1,9 @@
-# Kimi-K3 engine port — extracted math spec and work order
+# Kimi-K3 engine port — extracted math spec
 
-Status: conversion of `/mnt/d/kimi_k3_i4` in progress (streaming `coli convert --repo
-moonshotai/Kimi-K3`); converter support landed in 78574be. This document is the
+Status: shipped. Converter support landed in 78574be, the engine forward in
+e8ba2de/706f55b, and the port is oracle-validated (teacher-forcing 16/16 against
+the pure-torch reference, c337602); the full 1.45 TB checkpoint converts and
+generates coherent text end-to-end. This document is the
 ground-truth spec for the C engine port, extracted 2026-07-27 from the K3 repo's
 `modeling_kimi_linear.py` / `configuration_kimi_k3.py` (repo sha 9f62e4e) and
 fla-org/flash-linear-attention `main` (`fla/ops/kda/*`, `fla/modules/fused_norm_gate.py`),
